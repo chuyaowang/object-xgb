@@ -9,3 +9,4 @@ This plugin is designed to process the results of pixel-level classification (li
 - [User Guide](User-Guide.md): Learn how to use the plugin for classification tasks.
 - [Architecture](Architecture.md): Detailed explanation of the internal data flow.
 - [API Reference](API-Reference.md): Technical details for developers.
+\n<!-- Last sync: 2026年 03月 16日 星期一 18:36:26 CET -->
