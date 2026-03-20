@@ -1,6 +1,7 @@
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import pandas as pd
 from napari.qt.threading import thread_worker
 from napari.utils import progress
 from qtpy.QtWidgets import (
@@ -12,7 +13,9 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 from scipy.ndimage import binary_fill_holes
-from skimage import measure
+from skimage import measure, morphology, segmentation
+from sklearn.cluster import KMeans
+from sklearn.svm import SVC
 
 from .feature_extraction import FeatureExtractor
 
@@ -55,7 +58,7 @@ class ObjectWidget(QWidget):
 
         self.btn_segment = QPushButton('Segment Objects')
         self.btn_segment.setToolTip(
-            'Generate unique object labels from the selected layer.'
+            'Generate unique object labels and automatically filter noise.'
         )
         self.btn_segment.clicked.connect(self.segment_objects)
         self.layout().addWidget(self.btn_segment)
@@ -137,9 +140,9 @@ class ObjectWidget(QWidget):
             'layer_type': layer_type,
             'name': layer.name,
             'path': path,
-            'objects': None,  # Identified unique labels
+            'objects': None,  # Filtered + dilated label image
             'labeled_slices': [],  # Indices for 3D stacks
-            'features': None,  # [object, feature] matrix
+            'features': None,  # pd.DataFrame
             'training_probabilities': None,
             'prediction_probabilities': None,
         }
@@ -255,6 +258,12 @@ class ObjectWidget(QWidget):
           (axis 1 for 4D, axis 0 for 3D), treats classes > 0 as foreground.
         - If Mask: Treats all values > 0 as foreground.
         Finally, assigns unique object IDs to all identified foreground objects.
+        1. Argmax (if probs) or Threshold.
+        2. Hole filling.
+        3. Initial labeling.
+        4. Automatic Size Filtering using K-Means and SVM on log-areas.
+        5. Dilation.
+        6. Sequential reindexing.
         """
         layer = self.get_selected_layer()
         if layer is None:
@@ -266,39 +275,125 @@ class ObjectWidget(QWidget):
         if state is None:
             return
 
-        data = layer.data
-        if state['layer_type'] == 'probabilities':
-            # Probability-to-Class logic:
-            # 2D multi-channel (orig 2D): (C, Y, X) -> axis 0
-            # 3D multi-channel (orig 3D): (Z, C, Y, X) -> axis 1
-            argmax_axis = 1 if state['orig_ndim'] == 3 else 0
-            class_map = np.argmax(data, axis=argmax_axis)
-            foreground = class_map > 0
-        else:
-            # Mask/Labels: Already integers
-            foreground = data > 0
+        self.btn_segment.setEnabled(False)
 
-        # Fill internal holes slice-by-slice for 3D stacks
-        if state['orig_ndim'] == 3:
-            for z in range(foreground.shape[0]):
-                foreground[z] = binary_fill_holes(foreground[z])
-        else:
-            foreground = binary_fill_holes(foreground)
+        @thread_worker
+        def _segment_worker():
+            data = layer.data
+            orig_ndim = state['orig_ndim']
 
-        # Assign unique IDs to discrete objects
-        labels = measure.label(foreground)
-        state['objects'] = labels
+            # 1. Pixel-wise segmentation
+            if state['layer_type'] == 'probabilities':
+                argmax_axis = 1 if orig_ndim == 3 else 0
+                class_map = np.argmax(data, axis=argmax_axis)
+                foreground = class_map > 0
+            else:
+                foreground = data > 0
 
-        new_name = f'{layer.name}_objects'
-        if new_name in self.viewer.layers:
-            self.viewer.layers[new_name].data = labels
-        else:
-            self.viewer.add_labels(labels, name=new_name)
+            # 2. Hole filling
+            if orig_ndim == 3:
+                for z in range(foreground.shape[0]):
+                    foreground[z] = binary_fill_holes(foreground[z])
+            else:
+                foreground = binary_fill_holes(foreground)
 
-        self.btn_extract.setEnabled(True)
+            # 3. Initial Labeling
+            raw_labels = measure.label(foreground)
+            props = measure.regionprops(raw_labels)
+            if not props:
+                return raw_labels, pd.DataFrame()
+
+            areas = np.array([p.area for p in props]).reshape(-1, 1)
+            log_areas = np.log10(areas)
+
+            # 4. Automated Thresholding (K-Means + SVM)
+            if len(props) > 1:
+                # Group into 2 clusters: Noise vs. Signal
+                kmeans = KMeans(n_clusters=2, n_init=10, random_state=42)
+                cluster_labels = kmeans.fit_predict(log_areas)
+
+                # Train SVM to find the optimal decision boundary (threshold)
+                svm = SVC(kernel='linear', C=1.0)
+                svm.fit(log_areas, cluster_labels)
+
+                # The decision boundary is where w*x + b = 0 => x = -b/w
+                w = svm.coef_[0]
+                b = svm.intercept_[0]
+                log_threshold = -b / w
+                threshold = 10**log_threshold
+
+                # Ensure threshold makes sense (between min and max area)
+                # If SVM fails to find a good boundary, default to cluster separation
+                if not (np.min(areas) < threshold < np.max(areas)):
+                    # Fallback: midpoint between cluster centers
+                    centers = 10 ** kmeans.cluster_centers_.flatten()
+                    threshold = np.mean(centers)
+
+                # Convert threshold to scalar for printing and comparison
+                threshold = float(np.squeeze(threshold))
+
+                print(
+                    f'[Object RF] Auto-detected size threshold: {threshold:.2f}'
+                )
+
+                # Filter noise
+                keep_labels = [p.label for p in props if p.area >= threshold]
+            else:
+                # Only one object, keep it
+                keep_labels = [p.label for p in props]
+
+            mask = np.isin(raw_labels, keep_labels)
+            filtered_labels = np.where(mask, raw_labels, 0)
+
+            # 5. Dilation (AFTER filtering)
+            if orig_ndim == 3:
+                footprint = morphology.ball(1)
+                processed_labels = morphology.dilation(
+                    filtered_labels, footprint=footprint
+                )
+            else:
+                footprint = morphology.disk(1)
+                processed_labels = morphology.dilation(
+                    filtered_labels, footprint=footprint
+                )
+
+            # 6. Relabel sequentially
+            final_labels, _, _ = segmentation.relabel_sequential(
+                processed_labels
+            )
+
+            # Initial features (area)
+            final_props = measure.regionprops(final_labels)
+            features = pd.DataFrame(
+                [{'label': p.label, 'area': p.area} for p in final_props]
+            )
+
+            return final_labels, features
+
+        def _on_done(result):
+            final_labels, features = result
+            state['objects'] = final_labels
+            state['features'] = features
+
+            new_name = f'{state["name"]}_objects'
+            if new_name in self.viewer.layers:
+                self.viewer.layers[new_name].data = final_labels
+            else:
+                self.viewer.add_labels(final_labels, name=new_name)
+
+            self.btn_segment.setEnabled(True)
+            self.btn_extract.setEnabled(True)
+            self.btn_train.setEnabled(not features.empty)
+            print(
+                f'[Object RF] Automatically filtered to {len(features)} objects.'
+            )
+
+        worker = _segment_worker()
+        worker.returned.connect(_on_done)
+        worker.start()
 
     def extract_features(self):
-        """Calculate features for current object set using a thread worker."""
+        """Calculate intensity features using a thread worker."""
         state = self.image_states.get(self._current_image)
         if state is None or state['objects'] is None:
             return
@@ -319,7 +414,8 @@ class ObjectWidget(QWidget):
         @thread_worker
         def _extract_worker():
             gen = self.feature_extractor.generate_features(
-                state['objects'], intensity_image=intensity_data
+                state['objects'],
+                intensity_image=intensity_data,
             )
             try:
                 while True:
@@ -335,15 +431,22 @@ class ObjectWidget(QWidget):
                 pbar.set_description(desc)
                 pbar.refresh()
             else:
-                # Final yield is the DataFrame
-                state['features'] = val
+                # Final yield is the full DataFrame (intensity features)
+                new_features = val
+                if state['features'] is not None:
+                    # Merge intensity features into the existing (area/label) DataFrame
+                    state['features'] = pd.merge(
+                        state['features'], new_features, on='label', how='left'
+                    )
+                else:
+                    state['features'] = new_features
 
         def _on_finished():
             pbar.close()
             self.btn_extract.setEnabled(True)
             if state['features'] is not None:
                 print(
-                    f'Extracted features for {len(state["features"])} objects.'
+                    f'Extracted all features for {len(state["features"])} objects.'
                 )
                 self.btn_train.setEnabled(True)
             else:

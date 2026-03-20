@@ -32,17 +32,22 @@ class FeatureExtractor:
             yield (
                 i + 1,
                 total_objects,
-                f'Extracting features for object {prop.label}...',
+                f'Extracting intensity features for object {prop.label}...',
             )
 
             # Feature dictionary for this object
             feat = {
                 'label': prop.label,
-                # Add more features here in the future
+                'mean_intensity': prop.mean_intensity
+                if intensity_image is not None
+                else 0,
+                'max_intensity': prop.max_intensity
+                if intensity_image is not None
+                else 0,
+                'min_intensity': prop.min_intensity
+                if intensity_image is not None
+                else 0,
             }
-
-            # Placeholder for exact feature creation logic
-            # (To be implemented)
 
             all_features.append(feat)
 
