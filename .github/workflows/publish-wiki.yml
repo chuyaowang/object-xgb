@@ -19,10 +19,10 @@ jobs:
       contents: write # To checkout the repo and push to the wiki
     steps:
       - name: Checkout main repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Sync Wiki Content
-        uses: Andrew-Chen-Wang/github-wiki-action@v4
+        uses: Andrew-Chen-Wang/github-wiki-action@v5
         with:
           # The path in the source repository to publish to the wiki
           path: docs/wiki
