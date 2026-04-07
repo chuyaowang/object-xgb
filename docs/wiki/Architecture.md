@@ -5,48 +5,69 @@ The **object-rf** plugin is structured into three main modules: GUI, Feature Ext
 ## Core Modules
 
 ### 1. `ObjectWidget` (`src/object_rf/_widget.py`)
-- Manages the state and user interactions.
+
+- Manages the state and user interactions via `image_states`.
 - Integrates with napari's layers to fetch data.
-- Handles threading via `napari.qt.threading.thread_worker` for feature extraction.
+- Orchestrates asynchronous workflows using `napari.qt.threading.thread_worker`.
+- Implements a memory-efficient "Create -> Predict -> Discard" loop for 3D stacks.
 
-### 2. `FeatureExtractor` (Planned `src/object_rf/features.py`)
-- Provides functions to compute morphological and intensity-based features.
-- Uses `scikit-image.measure.regionprops` and `regionprops_table`.
-- Returns pandas DataFrames/tables for training.
+### 2. `FeatureExtractor` (`src/object_rf/feature_extraction.py`)
 
-### 3. `ObjectClassifier` (Planned `src/object_rf/classifier.py`)
+- Implements slice-by-slice feature extraction for both 2D and 3D data.
+- Performs 0.5-99.5% intensity clipping for robust normalization.
+- Generates a rich feature set including geometry (Log Area, Eccentricity, Circularity, Log Hu Moments) and multi-layer intensity statistics (Raw, Sobel, Frangi).
+
+### 3. `ObjectClassifier` (`src/object_rf/classifier.py`)
+
 - A wrapper around `sklearn.ensemble.RandomForestClassifier`.
-- Fits the model on provided features and annotations.
-- Predicts class labels for new objects.
+- Optimized to use `predict_proba` for single-pass inference of both class labels and probabilities.
 
 ## Data Flow Diagram
 
 ```mermaid
 graph TD
-    A[Pixel Probs / Mask] -->|Threshold/Label| B(Object Labels)
-    B -->|RegionProps| C(Feature Table)
-    C -->|User Annotations| D{Random Forest Model}
-    C -->|Prediction| E[Classified Objects]
+%%{init: {"flowchart": {"defaultRenderer": "elk"}} }%%
+    A[Pixel Probs / Mask] -->|Argmax/Label| B(Object Labels)
+    B -->|Feature Extraction| C(Feature DataFrame)
+    C -->|Intersection with Labels Layer| D{Random Forest Model}
+    C -->|predict_proba| E[Probabilities map]
+    E -->|argmax| F[Classified Objects]
     D --> E
 ```
 
 ## Segmentation Pipeline
 
-To ensure high-quality object classification, `object-rf` uses a robust, multi-step pipeline to transform pixel-level probability maps into unique, clean object labels.
+To ensure high-quality object classification, `object-rf` uses a robust, multi-step pipeline to segment objects from pixel-level predictions (from `napari-rf`):
 
-1.  **Probability to Mask (`argmax`)**:
-    -   Probability stacks from `napari-rf` are converted to integer class maps by taking the `argmax` across the probability dimension (axis 1 for 3D, axis 0 for 2D).
-    -   Foreground is defined as any pixel with a class ID > 0.
-2.  **Morphological Pre-processing**:
-    -   `binary_fill_holes` is applied to ensure objects are solid. For 3D stacks, this is performed slice-by-slice to preserve axial structures while filling internal gaps.
-3.  **Initial Object Labeling**:
-    -   `skimage.measure.label` generates unique integer IDs for all connected components.
-4.  **Automated Size Filtering (Noise Removal)**:
-    -   **Log-Transformation**: Areas of all initial objects are converted to `log10` space to compress high-magnitude variance and highlight scale-based differences.
-    -   **Clustering (K-Means)**: `KMeans(n_clusters=2)` separates objects into "Noise" and "Signal" populations based on their log-areas.
-    -   **Optimization (SVM)**: A linear Support Vector Machine (`SVC`) is trained on the log-areas to find the optimal decision boundary that best separates the two clusters.
-    -   **Thresholding**: Objects with areas below the SVM boundary are discarded, effectively removing false positives from the pixel-level classifier.
-5.  **Dilation**:
-    -   The remaining objects are dilated (Radius 1: `ball` for 3D, `disk` for 2D) using `morphology.dilation`. This ensures the object boundaries encompass the full intensity transition zones, improving feature extraction accuracy.
-6.  **Sequential Relabeling**:
-    -   `segmentation.relabel_sequential` is used to ensure label IDs are continuous (1 to $N$) and synchronized with the internal feature matrix.
+1. **Probability to Mask (`argmax`)**:
+    - Probability stacks from `napari-rf` are converted to class maps.
+    - Foreground is defined as any pixel with a class ID > 0.
+2. **Morphological Pre-processing**:
+    - `binary_fill_holes` is applied slice-by-slice.
+3. **Initial Object Labeling**:
+    - `skimage.measure.label` generates unique integer IDs.
+4. **Automated Size Filtering (Noise Removal)**:
+    - **Trigger**: Only runs if objects with area $\le 10$ pixels are detected.
+    - **Log-Transformation**: Areas are converted to `log10` space.
+    - **Clustering (K-Means)**: Separates objects into "Noise" and "Signal" populations.
+    - **Optimization (SVM)**: Finds the optimal decision boundary between the two clusters.
+5. **Dilation**:
+    - Remaining objects are dilated (Radius 1) to capture full intensity boundaries.
+6. **Sequential Relabeling**:
+    - Ensures label IDs are continuous (1 to $N$).
+
+## Memory-Efficient 3D Workflow
+
+To handle large 3D stacks without exhausting RAM, `object-rf` uses a transient feature processing strategy:
+
+1. **Training**: Features are extracted *only* for objects in slices containing user annotations.
+2. **Inference (Apply RF)**: The plugin iterates through the stack slice-by-slice. For each slice, it extracts features, predicts probabilities, "paints" them into the dense output buffer, and immediately discards the feature DataFrame.
+
+## Feature Engineering Pipeline
+
+Objects are characterized by a combination of shape and internal texture derived from three image layers:
+
+- **Geometry (Label Mask)**: Log Area, Eccentricity, Circularity, and 7 Log-Hu Moments.
+- **Intensity (Raw Image)**: First-order statistics (Mean, Var, Skew, Kurtosis) and a 10-bin normalized histogram.
+- **Edge Texture (Sobel Filter)**: Highlights sharp intensity transitions (e.g., chromatin granularity).
+- **Tubular Texture (Frangi Filter)**: Highlights ridge-like structures (e.g., internal filaments or hyphal infection).

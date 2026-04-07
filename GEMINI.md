@@ -66,6 +66,7 @@
     - **`image`**: Refers to the data source or image object.
     - **`slice`**: Refers to a specific 2D plane within a 3D stack.
     - **`layer`**: Reserved specifically for napari UI layer components.
+- **Docstrings**: Function docstrings must be detailed and explicit. Always include the purpose of the function, and use standard sections for `Parameters` (including shapes and types) and `Returns`/`Yields` (including precise return types like `list[dict]` or `pd.DataFrame`).
 - **Condition Flags**: Use explicit function arguments (e.g., `feature_type="training"`) to communicate intent instead of checking variable properties (like list lengths) to infer logic.
 - **Status Reporting**: Provide clear console reports for the lifecycle of operations:
     - **Success/Failure**: Report the outcome of training, prediction, and I/O.
