@@ -15,6 +15,7 @@ class FeatureExtractor:
         label_image: np.ndarray,
         intensity_image: np.ndarray = None,
         indices: list[int] = None,
+        target_labels: list[int] | set[int] | None = None,
     ):
         """
         Generator that yields progress (current_step, total_steps, description)
@@ -30,6 +31,8 @@ class FeatureExtractor:
         indices : list[int], optional
             For 3D images, only generate features for these specific slice indices.
             If None, all slices in the 3D stack are processed.
+        target_labels : list[int] | set[int], optional
+            Specific object labels to compute features for. If provided, other objects are skipped to save time.
 
         Yields
         ------
@@ -40,6 +43,9 @@ class FeatureExtractor:
         if intensity_image is None:
             yield (0, 0, 'Intensity image required for advanced features')
             return pd.DataFrame()
+
+        if target_labels is not None:
+            target_labels = set(target_labels)
 
         # Step 1: Normalize (0.5-99.5% clip)
         v_min, v_max = np.percentile(intensity_image, (0.5, 99.5))
@@ -82,6 +88,13 @@ class FeatureExtractor:
             list[dict]
                 A list of dictionaries, where each dictionary contains the computed features for a single object.
             """
+            # If target_labels is provided, check if any of them exist in this slice
+            if target_labels is not None:
+                # Fast check if any target label is in the slice
+                slice_labels = np.unique(l_slice)
+                if not any(lbl in target_labels for lbl in slice_labels):
+                    return []
+
             # Precompute full-slice filters to avoid bounding box edge artifacts
             sobel_slice = filters.sobel(i_slice)
             with warnings.catch_warnings():
@@ -93,6 +106,8 @@ class FeatureExtractor:
 
             for prop in props:
                 lbl = prop.label
+                if target_labels is not None and lbl not in target_labels:
+                    continue
 
                 # --- 1. Geometry Features ---
                 area = (

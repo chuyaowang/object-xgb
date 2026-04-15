@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import pandas as pd
 from joblib import dump, load
 from napari.qt.threading import thread_worker
 from napari.utils import progress
@@ -124,6 +125,13 @@ class ObjectWidget(QWidget):
         self.btn_save_full_preds.clicked.connect(self.save_predictions)
         self.layout().addWidget(self.btn_save_full_preds)
 
+        self.btn_save_features = QPushButton('Save Features (CSV)')
+        self.btn_save_features.setToolTip(
+            'Save the full feature matrix for all objects as a CSV file.'
+        )
+        self.btn_save_features.clicked.connect(self.save_features)
+        self.layout().addWidget(self.btn_save_features)
+
         # 5. Reset
         self.btn_reset = QPushButton('Reset All')
         self.btn_reset.setToolTip(
@@ -176,8 +184,7 @@ class ObjectWidget(QWidget):
             'path': path,
             'objects': None,  # Filtered + dilated label image
             'labeled_slices': [],  # Indices for 3D stacks
-            'training_features': None,  # DataFrame for training
-            'prediction_features': None,  # DataFrame for last processed slice
+            'full_feature_table': None,  # Master DataFrame for all processed objects
             'training_probabilities': None,  # Buffer for training slice probs (Z, C, Y, X)
             'prediction_probabilities': None,  # Buffer for full stack probs (Z, C, Y, X)
         }
@@ -189,6 +196,17 @@ class ObjectWidget(QWidget):
     def _on_layer_change(self, event=None):
         """Update dropdowns and manage state transition between image layers."""
         import napari
+
+        # Check for accidentally imported Image layers that should be Labels
+        for layer in list(self.viewer.layers):
+            if isinstance(layer, napari.layers.Image) and layer.name.endswith(
+                '_object_manual_labels'
+            ):
+                data = layer.data.astype(np.uint8)
+                name = layer.name
+                self.viewer.layers.remove(layer)
+                self.viewer.add_labels(data, name=name)
+                return  # Adding the new layer will re-trigger this function
 
         # 1. Update Dropdowns
         current_layer_name = self.layer_combo.currentText()
@@ -253,8 +271,7 @@ class ObjectWidget(QWidget):
                 if any(
                     state[x] is not None
                     for x in [
-                        'training_features',
-                        'prediction_features',
+                        'full_feature_table',
                         'training_probabilities',
                         'prediction_probabilities',
                     ]
@@ -296,7 +313,8 @@ class ObjectWidget(QWidget):
         self.btn_add_labels.setEnabled(has_layers)
 
         has_objects = state is not None and state['objects'] is not None
-        has_manual_labels = 'Object Labels' in self.viewer.layers
+        manual_labels_layer = self.get_manual_labels_layer()
+        has_manual_labels = manual_labels_layer is not None
 
         self.btn_train.setEnabled(has_objects and has_manual_labels)
         self.btn_predict.setEnabled(self._clf_ready and has_objects)
@@ -308,10 +326,14 @@ class ObjectWidget(QWidget):
         has_train_preds = (
             state is not None and state['training_probabilities'] is not None
         )
+        has_features = (
+            state is not None and state['full_feature_table'] is not None
+        )
 
         self.btn_save_preds.setEnabled(has_full_preds)
         self.btn_save_training_preds.setEnabled(has_train_preds)
         self.btn_save_full_preds.setEnabled(has_full_preds)
+        self.btn_save_features.setEnabled(has_features)
 
     def add_labels_layer(self):
         """Add a new labels layer named 'Object Labels' with the correct shape."""
@@ -319,10 +341,9 @@ class ObjectWidget(QWidget):
         if active_layer is None:
             return
 
-        if 'Object Labels' in self.viewer.layers:
-            self.viewer.layers.selection.active = self.viewer.layers[
-                'Object Labels'
-            ]
+        manual_labels_layer = self.get_manual_labels_layer()
+        if manual_labels_layer is not None:
+            self.viewer.layers.selection.active = manual_labels_layer
             return
 
         # Determine shape from intensity image or objects
@@ -356,6 +377,18 @@ class ObjectWidget(QWidget):
         name = self.image_combo.currentText()
         if name in self.viewer.layers:
             return self.viewer.layers[name]
+        return None
+
+    def get_manual_labels_layer(self):
+        """Find the manual labels layer, either named 'Object Labels' or imported from a saved file."""
+        import napari
+
+        for layer in self.viewer.layers:
+            if isinstance(layer, napari.layers.Labels) and (
+                layer.name == 'Object Labels'
+                or layer.name.endswith('_object_manual_labels')
+            ):
+                return layer
         return None
 
     def _get_class_map(self, prob_map):
@@ -520,62 +553,6 @@ class ObjectWidget(QWidget):
         worker.returned.connect(_on_done)
         worker.start()
 
-    def create_features(
-        self, callback=None, slice_indices=None, feature_type='prediction'
-    ):
-        """Extract features explicitly based on user requested slices."""
-        active_image = self.get_selected_layer()
-        if active_image is None or active_image not in self.image_states:
-            return
-
-        state = self.image_states[active_image]
-        if state['objects'] is None:
-            return
-
-        intensity_layer = self.get_intensity_layer()
-        if intensity_layer is None:
-            print('[Object RF] No intensity image selected.')
-            return
-
-        self.btn_train.setEnabled(False)
-        self.btn_predict.setEnabled(False)
-
-        pbar = progress(desc='Generating Features')
-
-        @thread_worker
-        def _create_features_worker():
-            yield from self.feature_extractor.generate_features(
-                state['objects'],
-                intensity_image=intensity_layer.data,
-                indices=slice_indices,
-            )
-
-        def _on_yielded(val):
-            if isinstance(val, tuple):
-                step, total, desc = val
-                pbar.total = total
-                pbar.n = step
-                pbar.set_description(desc)
-                pbar.refresh()
-            else:
-                # Update state caches explicitly based on purpose
-                if feature_type == 'training':
-                    state['training_features'] = (
-                        val  # TODO: check if multi-slice features are cached for training
-                    )
-                else:
-                    state['prediction_features'] = val
-
-        def _on_finished():
-            pbar.close()
-            if callback:
-                callback()
-
-        worker = _create_features_worker()
-        worker.yielded.connect(_on_yielded)
-        worker.finished.connect(_on_finished)
-        worker.start()
-
     def train_classifier(self):
         """Extract features ONLY for user-labeled slices, train RF, and display training probabilities."""
         active_image = self.get_selected_layer()
@@ -584,7 +561,8 @@ class ObjectWidget(QWidget):
         if state is None or state['objects'] is None:
             return
 
-        if 'Object Labels' not in self.viewer.layers:
+        manual_labels_layer = self.get_manual_labels_layer()
+        if manual_labels_layer is None:
             print(
                 "[Object RF] Please create a 'Object Labels' layer and annotate some objects."
             )
@@ -595,7 +573,7 @@ class ObjectWidget(QWidget):
             print('[Object RF] No intensity image selected.')
             return
 
-        training_labels = self.viewer.layers['Object Labels'].data
+        training_labels = manual_labels_layer.data
         is_3d = state['orig_ndim'] == 3
 
         # Shape Validation Check
@@ -632,7 +610,30 @@ class ObjectWidget(QWidget):
 
         @thread_worker
         def _train_worker():
-            # 1. Generate features ONLY for annotated slices
+            # 0. Find target labels that have annotations
+            target_labels = set()
+            for z in labeled_slices:
+                if is_3d:
+                    obj_slice = state['objects'][z]
+                    ann_slice = training_labels[z]
+                else:
+                    obj_slice = state['objects']
+                    ann_slice = training_labels
+
+                mask = ann_slice > 0
+                labeled_objs = np.unique(obj_slice[mask])
+                for obj_id in labeled_objs:
+                    if obj_id > 0:
+                        target_labels.add(obj_id)
+
+            if not target_labels:
+                print(
+                    '[Object RF] No overlapping annotations found for the objects.'
+                )
+                yield None
+                return
+
+            # 1. Generate features for all objects on annotated slices
             gen = self.feature_extractor.generate_features(
                 state['objects'],
                 intensity_image=intensity_layer.data,
@@ -650,14 +651,18 @@ class ObjectWidget(QWidget):
                 yield None
                 return
 
+            feats_df['true_label'] = 0
+
             # 2. Match objects with user annotations to build training set
             X_train = []
             y_train = []
             feature_cols = [
-                c for c in feats_df.columns if c not in ('label', 'slice_id')
+                c
+                for c in feats_df.columns
+                if c not in ('label', 'slice_id', 'true_label')
             ]
 
-            for _, row in feats_df.iterrows():
+            for idx, row in feats_df.iterrows():
                 lbl = int(row['label'])
                 z = int(row['slice_id'])
 
@@ -672,6 +677,7 @@ class ObjectWidget(QWidget):
                 # Use the max class ID drawn inside the object
                 max_cls = np.max(ann)
                 if max_cls > 0:
+                    feats_df.at[idx, 'true_label'] = max_cls
                     X_train.append(row[feature_cols].values)
                     y_train.append(max_cls)
 
@@ -684,6 +690,23 @@ class ObjectWidget(QWidget):
 
             # 3. Train Classifier
             self.clf.train(X_train, y_train)
+
+            # Store the training features into the full_feature_table
+            if state['full_feature_table'] is None:
+                state['full_feature_table'] = feats_df
+            else:
+                existing_df = state['full_feature_table']
+                if 'true_label' not in existing_df.columns:
+                    existing_df['true_label'] = 0
+
+                # Remove rows corresponding to these slices to replace them
+                existing_df = existing_df[
+                    ~existing_df['slice_id'].isin(labeled_slices)
+                ]
+
+                state['full_feature_table'] = pd.concat(
+                    [existing_df, feats_df], ignore_index=True
+                )
 
             # 4. Predict probabilities on training slices to generate a preview
             X_all = feats_df[feature_cols].values
@@ -747,6 +770,7 @@ class ObjectWidget(QWidget):
             if self._clf_ready:
                 self.btn_predict.setEnabled(True)
                 self.btn_save_model.setEnabled(True)
+                self._on_layer_change()
                 print('[Object RF] Training completed successfully.')
 
         worker = _train_worker()
@@ -779,6 +803,7 @@ class ObjectWidget(QWidget):
         def _apply_rf_worker():
             classes = self.clf.clf.classes_
             n_classes = len(classes)
+            all_collected_features = []
 
             if is_3d:
                 prob_results = np.zeros(
@@ -797,18 +822,21 @@ class ObjectWidget(QWidget):
             if is_3d:
                 total_slices = state['objects'].shape[0]
                 for z in range(total_slices):
-                    # Hybrid Workflow: Reuse training features if available, otherwise generate
-                    if (
-                        z in state['labeled_slices']
-                        and state['training_features'] is not None
-                    ):
-                        # Find the rows corresponding to this slice
-                        tf = state['training_features']
-                        feats_df = tf[tf['slice_id'] == z].copy()
+                    # Hybrid Workflow: Reuse cached features from table if available
+                    existing_df = None
+                    if state['full_feature_table'] is not None:
+                        mask = state['full_feature_table']['slice_id'] == z
+                        if mask.any():
+                            existing_df = state['full_feature_table'][
+                                mask
+                            ].copy()
+
+                    if existing_df is not None:
+                        feats_df = existing_df
                         yield (
                             z + 1,
                             total_slices,
-                            f'Slice {z + 1}/{total_slices}: Reusing training features',
+                            f'Slice {z + 1}/{total_slices}: Reusing cached features',
                         )
                     else:
                         gen = self.feature_extractor.generate_features(
@@ -828,10 +856,11 @@ class ObjectWidget(QWidget):
                                 feats_df = val
 
                     if feats_df is not None and not feats_df.empty:
+                        all_collected_features.append(feats_df)
                         feature_cols = [
                             c
                             for c in feats_df.columns
-                            if c not in ('label', 'slice_id')
+                            if c not in ('label', 'slice_id', 'true_label')
                         ]
                         X = feats_df[feature_cols].values
                         probas = self.clf.predict_proba(X)
@@ -843,12 +872,16 @@ class ObjectWidget(QWidget):
                             for c_idx in range(n_classes):
                                 prob_results[z, c_idx][mask] = probas[i][c_idx]
 
-                    if z == total_slices - 1:
-                        state['prediction_features'] = feats_df
+                # Update master feature table with all collected data
+                if all_collected_features:
+                    state['full_feature_table'] = pd.concat(
+                        all_collected_features, ignore_index=True
+                    )
+
                 yield prob_results
             else:
-                # 2D: Use existing cache if valid
-                if state['prediction_features'] is None:
+                # 2D: Reuse existing table if available
+                if state['full_feature_table'] is None:
                     gen = self.feature_extractor.generate_features(
                         state['objects'], intensity_image=intensity_layer.data
                     )
@@ -858,14 +891,14 @@ class ObjectWidget(QWidget):
                             yield (0, 1, val[2])
                         else:
                             feats_df = val
-                    state['prediction_features'] = feats_df
+                    state['full_feature_table'] = feats_df
 
-                feats_df = state['prediction_features']
+                feats_df = state['full_feature_table']
                 if feats_df is not None and not feats_df.empty:
                     feature_cols = [
                         c
                         for c in feats_df.columns
-                        if c not in ('label', 'slice_id')
+                        if c not in ('label', 'slice_id', 'true_label')
                     ]
                     X = feats_df[feature_cols].values
                     probas = self.clf.predict_proba(X)
@@ -931,10 +964,11 @@ class ObjectWidget(QWidget):
         return save_dir
 
     def save_labels(self):
-        if 'Object Labels' in self.viewer.layers:
+        manual_labels_layer = self.get_manual_labels_layer()
+        if manual_labels_layer is not None:
             try:
                 state = self.image_states.get(self._current_image)
-                labels = self.viewer.layers['Object Labels'].data
+                labels = manual_labels_layer.data
 
                 is_3d = state and state['orig_ndim'] == 3
                 if state and not is_3d and labels.ndim == 3:
@@ -955,7 +989,7 @@ class ObjectWidget(QWidget):
             except (OSError, ValueError, RuntimeError) as e:
                 print(f'[Object RF] Error in save_labels: {e}')
         else:
-            print("[Object RF] No 'Object Labels' layer found to save.")
+            print('[Object RF] No manual labels layer found to save.')
 
     def save_predictions(self):
         active_image = self.get_selected_layer()
@@ -963,6 +997,22 @@ class ObjectWidget(QWidget):
         if state and state['prediction_probabilities'] is not None:
             self._save_state_outputs(
                 state, 'prediction_probabilities', 'object_full'
+            )
+
+    def save_features(self):
+        active_image = self.get_selected_layer()
+        state = self.image_states.get(active_image)
+        if state and state['full_feature_table'] is not None:
+            save_dir = self._get_save_dir(state)
+            intensity_layer = self.get_intensity_layer()
+            name = intensity_layer.name if intensity_layer else state['name']
+            save_path = save_dir / f'{name}_full_features.csv'
+
+            state['full_feature_table'].to_csv(save_path, index=False)
+            print(f'[Object RF] Saved full feature table to {save_path}')
+        else:
+            print(
+                "[Object RF] No feature table available. Run 'Apply RF' first."
             )
 
     def save_training_predictions(self):
