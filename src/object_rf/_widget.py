@@ -303,12 +303,12 @@ class ObjectWidget(QWidget):
             )
 
         def _on_yielded(val):
-            if isinstance(val, tuple):
+            if isinstance(val, tuple) and len(val) == 3:
                 step, total, desc = val
                 pbar.total, pbar.n = total, step
                 pbar.set_description(desc)
                 pbar.refresh()
-            elif val is not None:
+            elif isinstance(val, tuple) and len(val) == 2:
                 feats_df, prob_buffer = val
                 self._clf_ready = True
                 state['training_probabilities'] = prob_buffer
