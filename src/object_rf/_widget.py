@@ -78,16 +78,25 @@ class ObjectWidget(QWidget):
     def _on_layer_change(self, event=None):
         """Update dropdowns and manage state transition between image layers."""
         import napari
+        from qtpy.QtCore import QTimer
 
         # Handle automatic conversion of Image layers to Labels if they look like annotations
+        # We use QTimer.singleShot(0, ...) to defer the replacement until the next event loop cycle,
+        # preventing ValueError when napari tries to select a layer we just removed during insertion.
         for layer in list(self.viewer.layers):
             if isinstance(layer, napari.layers.Image) and layer.name.endswith(
                 '_object_manual_labels'
             ):
-                data = layer.data.astype(np.uint8)
-                name = layer.name
-                self.viewer.layers.remove(layer)
-                self.viewer.add_labels(data, name=name)
+
+                def replace_layer(layer_to_replace=layer):
+                    if layer_to_replace in self.viewer.layers:
+                        data = layer_to_replace.data.astype(np.uint8)
+                        name = layer_to_replace.name
+                        self.viewer.layers.remove(layer_to_replace)
+                        new_layer = self.viewer.add_labels(data, name=name)
+                        self.viewer.layers.selection.active = new_layer
+
+                QTimer.singleShot(0, replace_layer)
                 return
 
         # 1. Update Dropdowns
