@@ -12,7 +12,11 @@
 - **joblib**: Model serialization.
 
 ### Key Architecture
-- **`ObjectWidget` (`src/object_rf/_widget.py`)**: (Planned) The main GUI for controlling thresholding, feature extraction, and training.
+- **Modular Design**: The plugin uses a component-based structure to separate concerns:
+    - **`_widget.py`**: The central orchestrator for UI signals and threading.
+    - **`state.py`**: Houses `ImageStateManager` for centralized tracking of image data, paths, and feature caches.
+    - **`workers.py`**: Contains decoupled pure Python generators for all heavy asynchronous algorithms (segmentation, training, prediction).
+    - **`components/`**: Directory containing isolated `QWidget` UI blocks.
 - **Feature Extraction**: Leverages `regionprops_table` to generate a tabular representation of objects for machine learning.
 - **Workflow**:
     1.  Convert Probability maps (from `napari-rf`) into Labels.
@@ -61,7 +65,8 @@
 - **State Management**: Persist feature tables associated with label layers to avoid redundant computations.
 
 ### Coding Style & Logic
-- **Explicit State Management**: Prefer centralized state dictionaries (`image_states`) to track data and caches. Avoid "magic number" shape checks (e.g., `ndim == 4`) to infer state.
+- **Separation of Concerns (Workers)**: Long-running algorithms MUST be placed in `workers.py` as pure functions or generators. They should yield progress and return results without interacting directly with `self.viewer` or Qt elements.
+- **Explicit State Management**: Prefer routing all state tracking and cache manipulation through `ImageStateManager` in `state.py`. Avoid "magic number" shape checks (e.g., `ndim == 4`) to infer state.
 - **Standardized Terminology**:
     - **`image`**: Refers to the data source or image object.
     - **`slice`**: Refers to a specific 2D plane within a 3D stack.

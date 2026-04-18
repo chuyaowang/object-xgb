@@ -4,23 +4,23 @@ The **object-rf** plugin is structured into three main modules: GUI, Feature Ext
 
 ## Core Modules
 
-### 1. `ObjectWidget` (`src/object_rf/_widget.py`)
+### 1. The Orchestrator (`src/object_rf/_widget.py`)
+- Acts as the central hub connecting UI signals to state management and background thread workers.
+- Delegates heavy logic to specific modules rather than implementing algorithms directly.
 
-- Manages the state and user interactions via `image_states`.
-- Integrates with napari's layers to fetch data.
-- Orchestrates asynchronous workflows using `napari.qt.threading.thread_worker`.
-- Implements a memory-efficient "Create -> Predict -> Discard" loop for 3D stacks.
+### 2. State Management (`src/object_rf/state.py`)
+- **`ImageStateManager`**: Centralized tracking of `Image` and `Labels` layers, their metadata (shapes, paths, original dimensionality), and cached features/probabilities.
 
-### 2. `FeatureExtractor` (`src/object_rf/feature_extraction.py`)
+### 3. Asynchronous Workers (`src/object_rf/workers.py`)
+- Contains pure Python functions and generators for computationally heavy tasks: segmentation, random forest training, and full-stack predictions.
+- Fully decoupled from `napari.viewer` and Qt GUI updates.
 
-- Implements slice-by-slice feature extraction for both 2D and 3D data.
-- Performs 0.5-99.5% intensity clipping for robust normalization.
-- Generates a rich feature set including geometry (Log Area, Eccentricity, Circularity, Log Hu Moments) and multi-layer intensity statistics (Raw, Sobel, Frangi).
+### 4. UI Components (`src/object_rf/components/`)
+- A modular collection of QWidgets breaking down the interface: `LayerSelectionWidget`, `ActionButtonsWidget`, `ClassifierControlsWidget`, and `IOControlsWidget`.
 
-### 3. `ObjectClassifier` (`src/object_rf/classifier.py`)
-
-- A wrapper around `sklearn.ensemble.RandomForestClassifier`.
-- Optimized to use `predict_proba` for single-pass inference of both class labels and probabilities.
+### 5. `FeatureExtractor` & `ObjectClassifier`
+- **`FeatureExtractor`**: Slice-by-slice 0.5-99.5% normalized multi-layer feature extraction (Geometry, Intensity, Texture).
+- **`ObjectClassifier`**: Wrapper around `RandomForestClassifier` optimized for `predict_proba` single-pass inference.
 
 ## Data Flow Diagram
 

@@ -1,28 +1,26 @@
-from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
 from joblib import dump, load
 from napari.qt.threading import thread_worker
 from napari.utils import progress
-from qtpy.QtWidgets import (
-    QComboBox,
-    QFileDialog,
-    QLabel,
-    QMessageBox,
-    QPushButton,
-    QVBoxLayout,
-    QWidget,
-)
-from scipy.ndimage import binary_fill_holes
-from skimage import measure, morphology, segmentation
+from qtpy.QtWidgets import QFileDialog, QMessageBox, QVBoxLayout, QWidget
 from skimage.io import imsave
-from sklearn.cluster import KMeans
-from sklearn.svm import SVC
 
 from .classifier import ObjectClassifier
+from .components.action_buttons import ActionButtonsWidget
+from .components.classifier_controls import ClassifierControlsWidget
+from .components.io_controls import IOControlsWidget
+from .components.layer_selection import LayerSelectionWidget
 from .feature_extraction import FeatureExtractor
+from .state import ImageStateManager
+from .utils import get_class_map, get_save_directory
+from .workers import (
+    apply_rf_worker,
+    segment_objects_worker,
+    train_classifier_worker,
+)
 
 if TYPE_CHECKING:
     import napari
@@ -33,10 +31,8 @@ class ObjectWidget(QWidget):
         super().__init__()
         self.viewer = viewer
 
-        # State management: Dictionary holding data and caches for each image layer
-        # Key: napari.layers.Image object, Value: dict of state
-        self.image_states: dict[napari.layers.Image, dict[str, Any]] = {}
-        self._current_image = None
+        # State management
+        self.state_manager = ImageStateManager()
         self.clf = ObjectClassifier()
         self._clf_ready = False
         self.feature_extractor = FeatureExtractor()
@@ -44,160 +40,46 @@ class ObjectWidget(QWidget):
         # --- UI Components ---
         self.setLayout(QVBoxLayout())
 
-        # 1. Image Layer Selection (Probabilities or masks)
-        self.layout().addWidget(QLabel('Select Probability/Label Layer:'))
-        self.layer_combo = QComboBox()
-        self.layer_combo.setToolTip(
-            'Select the image (probabilities) or label layer to segment.'
+        self.layer_selection = LayerSelectionWidget()
+        self.layer_selection.layer_changed.connect(self._on_layer_change)
+        self.layout().addWidget(self.layer_selection)
+
+        self.action_buttons = ActionButtonsWidget()
+        self.action_buttons.segment_requested.connect(self.segment_objects)
+        self.action_buttons.add_labels_requested.connect(self.add_labels_layer)
+        self.layout().addWidget(self.action_buttons)
+
+        self.classifier_controls = ClassifierControlsWidget()
+        self.classifier_controls.train_requested.connect(self.train_classifier)
+        self.classifier_controls.predict_requested.connect(
+            self.predict_objects
         )
-        self.layer_combo.currentIndexChanged.connect(self._on_layer_change)
-        self.layout().addWidget(self.layer_combo)
+        self.layout().addWidget(self.classifier_controls)
 
-        # 2. Original Image Selection (Intensity Source)
-        self.layout().addWidget(QLabel('Select Original Intensity Image:'))
-        self.image_combo = QComboBox()
-        self.image_combo.setToolTip(
-            'Select the original image to use as the intensity source for features.'
+        self.io_controls = IOControlsWidget()
+        self.io_controls.load_model_requested.connect(self.load_model)
+        self.io_controls.save_model_requested.connect(self.save_model)
+        self.io_controls.save_labels_requested.connect(self.save_labels)
+        self.io_controls.save_predictions_requested.connect(
+            self.save_predictions
         )
-        self.layout().addWidget(self.image_combo)
-
-        self.btn_segment = QPushButton('Segment Objects')
-        self.btn_segment.setToolTip(
-            'Generate unique object labels and automatically filter noise.'
-        )
-        self.btn_segment.clicked.connect(self.segment_objects)
-        self.layout().addWidget(self.btn_segment)
-
-        self.btn_add_labels = QPushButton('Draw Labels')
-        self.btn_add_labels.setToolTip(
-            'Add a new labels layer for manual annotations.'
-        )
-        self.btn_add_labels.clicked.connect(self.add_labels_layer)
-        self.layout().addWidget(self.btn_add_labels)
-
-        # 3. Training & Classification
-        self.btn_train = QPushButton('Train Object Classifier')
-        self.btn_train.clicked.connect(self.train_classifier)
-        self.btn_train.setDisabled(True)
-        self.btn_train.setToolTip(
-            "Train the classifier using the 'Object Labels' and features from the selected image."
-        )
-        self.layout().addWidget(self.btn_train)
-
-        self.btn_predict = QPushButton('Apply Random Forest')
-        self.btn_predict.clicked.connect(self.predict_objects)
-        self.btn_predict.setDisabled(True)
-        self.layout().addWidget(self.btn_predict)
-
-        # 4. IO
-        self.btn_load_model = QPushButton('Load Classifier')
-        self.btn_load_model.clicked.connect(self.load_model)
-        self.layout().addWidget(self.btn_load_model)
-
-        self.btn_save_model = QPushButton('Save Classifier')
-        self.btn_save_model.clicked.connect(self.save_model)
-        self.btn_save_model.setDisabled(True)
-        self.layout().addWidget(self.btn_save_model)
-
-        self.btn_save_labels = QPushButton('Save Labels')
-        self.btn_save_labels.setToolTip(
-            'Save the manually drawn labels as a TIFF file.'
-        )
-        self.btn_save_labels.clicked.connect(self.save_labels)
-        self.layout().addWidget(self.btn_save_labels)
-
-        # 2D Save button
-        self.btn_save_preds = QPushButton('Save Predictions')
-        self.btn_save_preds.setToolTip(
-            'Save predicted class labels and probability maps.'
-        )
-        self.btn_save_preds.clicked.connect(self.save_predictions)
-        self.layout().addWidget(self.btn_save_preds)
-
-        # 3D Specific Save buttons
-        self.btn_save_training_preds = QPushButton('Save Training Predictions')
-        self.btn_save_training_preds.clicked.connect(
+        self.io_controls.save_training_predictions_requested.connect(
             self.save_training_predictions
         )
-        self.layout().addWidget(self.btn_save_training_preds)
-
-        self.btn_save_full_preds = QPushButton('Save Full Stack Predictions')
-        self.btn_save_full_preds.clicked.connect(self.save_predictions)
-        self.layout().addWidget(self.btn_save_full_preds)
-
-        self.btn_save_features = QPushButton('Save Features (CSV)')
-        self.btn_save_features.setToolTip(
-            'Save the full feature matrix for all objects as a CSV file.'
-        )
-        self.btn_save_features.clicked.connect(self.save_features)
-        self.layout().addWidget(self.btn_save_features)
-
-        # 5. Reset
-        self.btn_reset = QPushButton('Reset All')
-        self.btn_reset.setToolTip(
-            'Reset internal model, features, and caches to original state.'
-        )
-        self.btn_reset.clicked.connect(self.reset_all)
-        self.layout().addWidget(self.btn_reset)
+        self.io_controls.save_features_requested.connect(self.save_features)
+        self.io_controls.reset_requested.connect(self.reset_all)
+        self.layout().addWidget(self.io_controls)
 
         # Connect layer events to keep the dropdown updated
         self.viewer.layers.events.inserted.connect(self._on_layer_change)
         self.viewer.layers.events.removed.connect(self._on_layer_change)
         self._on_layer_change()
 
-    def _init_image_state(self, layer):
-        """Initialize the state dictionary for a specific layer (Image or Labels)."""
-        if layer is None or layer in self.image_states:
-            return
-
-        import napari
-
-        path = None
-        source = getattr(layer, 'source', None)
-        raw_path = getattr(source, 'path', None)
-        if raw_path:
-            path = str(
-                raw_path[0]
-                if isinstance(raw_path, (list, tuple))
-                else raw_path
-            )
-
-        # Determine layer type and original image dimensionality
-        data = layer.data
-        if isinstance(layer, napari.layers.Image):
-            if np.issubdtype(data.dtype, np.floating):
-                layer_type = 'probabilities'
-                orig_ndim = data.ndim - 1
-            else:
-                layer_type = 'mask'
-                orig_ndim = data.ndim
-        else:
-            layer_type = 'mask'
-            orig_ndim = data.ndim
-
-        self.image_states[layer] = {
-            'data': data,
-            'ndim': data.ndim,
-            'orig_ndim': orig_ndim,
-            'layer_type': layer_type,
-            'name': layer.name,
-            'path': path,
-            'objects': None,  # Filtered + dilated label image
-            'labeled_slices': [],  # Indices for 3D stacks
-            'full_feature_table': None,  # Master DataFrame for all processed objects
-            'training_probabilities': None,  # Buffer for training slice probs (Z, C, Y, X)
-            'prediction_probabilities': None,  # Buffer for full stack probs (Z, C, Y, X)
-        }
-        print(
-            f'[Object RF] Initialized state for: {layer.name} '
-            f'(Type: {layer_type}, Orig NDIM: {orig_ndim})'
-        )
-
     def _on_layer_change(self, event=None):
         """Update dropdowns and manage state transition between image layers."""
         import napari
 
-        # Check for accidentally imported Image layers that should be Labels
+        # Handle automatic conversion of Image layers to Labels if they look like annotations
         for layer in list(self.viewer.layers):
             if isinstance(layer, napari.layers.Image) and layer.name.endswith(
                 '_object_manual_labels'
@@ -206,68 +88,22 @@ class ObjectWidget(QWidget):
                 name = layer.name
                 self.viewer.layers.remove(layer)
                 self.viewer.add_labels(data, name=name)
-                return  # Adding the new layer will re-trigger this function
+                return
 
         # 1. Update Dropdowns
-        current_layer_name = self.layer_combo.currentText()
-        current_image_name = self.image_combo.currentText()
-
-        self.layer_combo.blockSignals(True)
-        self.image_combo.blockSignals(True)
-
-        self.layer_combo.clear()
-        self.image_combo.clear()
-
-        image_layers = [
-            layer
-            for layer in self.viewer.layers
-            if isinstance(layer, napari.layers.Image)
-        ]
-        label_layers = [
-            layer
-            for layer in self.viewer.layers
-            if isinstance(layer, napari.layers.Labels)
-            and '_objects' not in layer.name
-            and layer.name != 'Object Labels'
-        ]
-
-        # layer_combo shows both Image and Labels
-        all_candidate_layers = image_layers + label_layers
-        self.layer_combo.addItems(
-            [layer.name for layer in all_candidate_layers]
-        )
-
-        # image_combo shows only Image
-        self.image_combo.addItems([layer.name for layer in image_layers])
-
-        # Restore selection
-        for i, layer in enumerate(all_candidate_layers):
-            if layer.name == current_layer_name:
-                self.layer_combo.setCurrentIndex(i)
-                break
-        else:
-            if all_candidate_layers:
-                self.layer_combo.setCurrentIndex(0)
-
-        for i, layer in enumerate(image_layers):
-            if layer.name == current_image_name:
-                self.image_combo.setCurrentIndex(i)
-                break
-        else:
-            if image_layers:
-                self.image_combo.setCurrentIndex(0)
-
-        self.layer_combo.blockSignals(False)
-        self.image_combo.blockSignals(False)
+        self.layer_selection.update_layers(self.viewer)
 
         # 2. Handle State Migration
-        active_layer = self.get_selected_layer()
-        if active_layer != self._current_image:
+        active_layer = self.layer_selection.get_selected_layer(self.viewer)
+        if active_layer != self.state_manager.current_image:
             if (
-                self._current_image
-                and self._current_image in self.image_states
+                self.state_manager.current_image
+                and self.state_manager.current_image
+                in self.state_manager.image_states
             ):
-                state = self.image_states[self._current_image]
+                state = self.state_manager.get_state(
+                    self.state_manager.current_image
+                )
                 if any(
                     state[x] is not None
                     for x in [
@@ -284,41 +120,37 @@ class ObjectWidget(QWidget):
                         QMessageBox.Yes,
                     )
                     if reply == QMessageBox.Yes:
-                        del self.image_states[self._current_image]
+                        self.state_manager.clear_state(
+                            self.state_manager.current_image
+                        )
                         print(
                             f'[Object RF] Cleared state for: {state["name"]}'
                         )
 
-            self._current_image = active_layer
-            self._init_image_state(active_layer)
+            self.state_manager.current_image = active_layer
+            self.state_manager.init_image_state(active_layer)
 
-        # 3. Dynamic UI Renaming and Visibility
-        state = self.image_states.get(active_layer)
+        # 3. Dynamic UI Updates
+        state = self.state_manager.get_state(active_layer)
         is_3d = state is not None and state['orig_ndim'] == 3
 
-        if is_3d:
-            self.btn_predict.setText('Apply RF to All Slices')
-            self.btn_save_preds.setVisible(False)
-            self.btn_save_training_preds.setVisible(True)
-            self.btn_save_full_preds.setVisible(True)
-        else:
-            self.btn_predict.setText('Apply Random Forest')
-            self.btn_save_preds.setVisible(True)
-            self.btn_save_training_preds.setVisible(False)
-            self.btn_save_full_preds.setVisible(False)
+        self.classifier_controls.set_3d_mode(is_3d)
+        self.io_controls.set_3d_mode(is_3d)
 
         # 4. Enable/Disable UI
         has_layers = active_layer is not None
-        self.btn_segment.setEnabled(has_layers)
-        self.btn_add_labels.setEnabled(has_layers)
+        self.action_buttons.set_enabled(has_layers)
 
         has_objects = state is not None and state['objects'] is not None
         manual_labels_layer = self.get_manual_labels_layer()
         has_manual_labels = manual_labels_layer is not None
 
-        self.btn_train.setEnabled(has_objects and has_manual_labels)
-        self.btn_predict.setEnabled(self._clf_ready and has_objects)
-        self.btn_save_labels.setEnabled(has_manual_labels)
+        self.classifier_controls.set_training_enabled(
+            has_objects and has_manual_labels
+        )
+        self.classifier_controls.set_predict_enabled(
+            self._clf_ready and has_objects
+        )
 
         has_full_preds = (
             state is not None and state['prediction_probabilities'] is not None
@@ -330,14 +162,15 @@ class ObjectWidget(QWidget):
             state is not None and state['full_feature_table'] is not None
         )
 
-        self.btn_save_preds.setEnabled(has_full_preds)
-        self.btn_save_training_preds.setEnabled(has_train_preds)
-        self.btn_save_full_preds.setEnabled(has_full_preds)
-        self.btn_save_features.setEnabled(has_features)
+        self.io_controls.set_save_model_enabled(self._clf_ready)
+        self.io_controls.set_save_labels_enabled(has_manual_labels)
+        self.io_controls.set_save_preds_enabled(has_full_preds)
+        self.io_controls.set_save_training_preds_enabled(has_train_preds)
+        self.io_controls.set_save_features_enabled(has_features)
 
     def add_labels_layer(self):
         """Add a new labels layer named 'Object Labels' with the correct shape."""
-        active_layer = self.get_selected_layer()
+        active_layer = self.layer_selection.get_selected_layer(self.viewer)
         if active_layer is None:
             return
 
@@ -346,20 +179,15 @@ class ObjectWidget(QWidget):
             self.viewer.layers.selection.active = manual_labels_layer
             return
 
-        # Determine shape from intensity image or objects
-        state = self.image_states.get(active_layer)
+        state = self.state_manager.get_state(active_layer)
         if state and state['objects'] is not None:
             shape = state['objects'].shape
         else:
-            # Fallback to active layer shape
             shape = active_layer.data.shape
             if state and state['layer_type'] == 'probabilities':
-                # Probabilities are (C, Y, X) or (Z, C, Y, X)
                 if state['orig_ndim'] == 3:
-                    # (Z, C, Y, X) -> (Z, Y, X)
                     shape = (shape[0], shape[2], shape[3])
                 else:
-                    # (C, Y, X) -> (Y, X)
                     shape = (shape[1], shape[2])
 
         self.viewer.add_labels(
@@ -367,20 +195,8 @@ class ObjectWidget(QWidget):
         )
         self._on_layer_change()
 
-    def get_selected_layer(self):
-        name = self.layer_combo.currentText()
-        if name in self.viewer.layers:
-            return self.viewer.layers[name]
-        return None
-
-    def get_intensity_layer(self):
-        name = self.image_combo.currentText()
-        if name in self.viewer.layers:
-            return self.viewer.layers[name]
-        return None
-
     def get_manual_labels_layer(self):
-        """Find the manual labels layer, either named 'Object Labels' or imported from a saved file."""
+        """Find the manual labels layer."""
         import napari
 
         for layer in self.viewer.layers:
@@ -391,201 +207,63 @@ class ObjectWidget(QWidget):
                 return layer
         return None
 
-    def _get_class_map(self, prob_map):
-        """Derive integer class map from probability map using argmax.
-        Ensures background pixels (where all probabilities are 0) remain 0.
-        """
-        if prob_map is None:
-            return None
-
-        # Use classes from current fitted model
-        if hasattr(self.clf, 'clf') and hasattr(self.clf.clf, 'classes_'):
-            classes = self.clf.clf.classes_
-        else:
-            return None
-
-        # prob_map: (Z, C, Y, X) for 3D, (C, Y, X) for 2D
-        is_3d = prob_map.ndim == 4
-        argmax_axis = 1 if is_3d else 0
-
-        max_probs = np.max(prob_map, axis=argmax_axis)
-        class_indices = np.argmax(prob_map, axis=argmax_axis)
-
-        # Map indices to actual class values
-        class_map = classes[class_indices].astype(np.uint8)
-
-        # Zero out background (where all probabilities were 0)
-        class_map[max_probs == 0] = 0
-
-        return class_map
-
     def segment_objects(self):
-        """
-        Segment objects from the selected layer.
-        - If Probabilities: Uses argmax to find the most likely class per pixel
-          (axis 1 for 4D, axis 0 for 3D), treats classes > 0 as foreground.
-        - If Mask: Treats all values > 0 as foreground.
-        Finally, assigns unique object IDs to all identified foreground objects.
-        1. Argmax (if probs) or Threshold.
-        2. Hole filling.
-        3. Initial labeling.
-        4. Automatic Size Filtering using K-Means and SVM on log-areas.
-        5. Dilation.
-        6. Sequential reindexing.
-        """
-        layer = self.get_selected_layer()
+        layer = self.layer_selection.get_selected_layer(self.viewer)
         if layer is None:
             return
 
-        # Ensure we have state for the active layer
-        self._init_image_state(layer)
-        state = self.image_states.get(layer)
+        self.state_manager.init_image_state(layer)
+        state = self.state_manager.get_state(layer)
         if state is None:
             return
 
-        self.btn_segment.setEnabled(False)
+        self.action_buttons.btn_segment.setEnabled(False)
 
         @thread_worker
-        def _segment_worker():
-            data = layer.data
-            orig_ndim = state['orig_ndim']
-
-            # 1. Pixel-wise segmentation
-            if state['layer_type'] == 'probabilities':
-                argmax_axis = 1 if orig_ndim == 3 else 0
-                class_map = np.argmax(data, axis=argmax_axis)
-                foreground = class_map > 0
-            else:
-                foreground = data > 0
-
-            # 2. Hole filling
-            if orig_ndim == 3:
-                for z in range(foreground.shape[0]):
-                    foreground[z] = binary_fill_holes(foreground[z])
-            else:
-                foreground = binary_fill_holes(foreground)
-
-            # 3. Initial Labeling
-            raw_labels = measure.label(foreground)
-            props = measure.regionprops(raw_labels)
-            if not props:
-                return raw_labels
-
-            areas = np.array([p.area for p in props]).reshape(-1, 1)
-
-            # 4. Automated Thresholding (K-Means + SVM)
-            # Only perform auto-thresholding if there are multiple objects
-            # AND at least one object is small (potential false positive from napari-rf)
-            if len(props) > 1 and np.any(areas <= 10):
-                log_areas = np.log10(areas)
-                kmeans = KMeans(n_clusters=2, n_init=10, random_state=42)
-                cluster_labels = kmeans.fit_predict(log_areas)
-
-                # Use SVM to find optimial separation between noise and objects
-                svm = SVC(kernel='linear', C=1.0)
-                svm.fit(log_areas, cluster_labels)
-
-                # Calculate optimal threshold
-                w = svm.coef_[0]
-                b = svm.intercept_[0]
-                log_threshold = -b / w
-                threshold = 10**log_threshold
-
-                # Ensure the threshold makes sense
-                if not (np.min(areas) < threshold < np.max(areas)):
-                    # Fallback: midpoint between cluster centers
-                    centers = 10 ** kmeans.cluster_centers_.flatten()
-                    threshold = np.mean(centers)
-
-                # Convert threshold to scalar for printing and comparison
-                threshold = float(np.squeeze(threshold))
-
-                print(
-                    f'[Object RF] Auto-detected size threshold: {threshold:.2f}'
-                )
-
-                # Filter noise
-                keep_labels = [p.label for p in props if p.area >= threshold]
-            else:
-                # Keep all objects if they are all > 10 pixels or only one object exists
-                keep_labels = [p.label for p in props]
-
-            mask = np.isin(raw_labels, keep_labels)
-            filtered_labels = np.where(mask, raw_labels, 0)
-
-            # 5. Dilation
-            if orig_ndim == 3:
-                footprint = morphology.ball(1)
-                processed_labels = morphology.dilation(
-                    filtered_labels, footprint=footprint
-                )
-            else:
-                footprint = morphology.disk(1)
-                processed_labels = morphology.dilation(
-                    filtered_labels, footprint=footprint
-                )
-
-            # 6. Relabel sequentially
-            final_labels, _, _ = segmentation.relabel_sequential(
-                processed_labels
+        def _worker():
+            return segment_objects_worker(
+                layer.data, state['orig_ndim'], state['layer_type']
             )
-
-            return final_labels
 
         def _on_done(result):
             state['objects'] = result
-
             new_name = f'{state["name"]}_objects'
             if new_name in self.viewer.layers:
                 self.viewer.layers[new_name].data = result
             else:
                 self.viewer.add_labels(result, name=new_name)
 
-            self.btn_segment.setEnabled(True)
+            self.action_buttons.btn_segment.setEnabled(True)
             self._on_layer_change()
 
-            n_objects = len(np.unique(result)) - 1  # Exclude background 0
+            n_objects = len(np.unique(result)) - 1
             print(
                 f'[Object RF] Object segmentation complete. Found {n_objects} objects.'
             )
 
-        worker = _segment_worker()
+        worker = _worker()
         worker.returned.connect(_on_done)
         worker.start()
 
     def train_classifier(self):
-        """Extract features ONLY for user-labeled slices, train RF, and display training probabilities."""
-        active_image = self.get_selected_layer()
-        state = self.image_states.get(active_image)
+        active_image = self.layer_selection.get_selected_layer(self.viewer)
+        state = self.state_manager.get_state(active_image)
 
         if state is None or state['objects'] is None:
             return
 
         manual_labels_layer = self.get_manual_labels_layer()
-        if manual_labels_layer is None:
-            print(
-                "[Object RF] Please create a 'Object Labels' layer and annotate some objects."
-            )
-            return
+        intensity_layer = self.layer_selection.get_intensity_layer(self.viewer)
 
-        intensity_layer = self.get_intensity_layer()
-        if intensity_layer is None:
-            print('[Object RF] No intensity image selected.')
+        if not manual_labels_layer or not intensity_layer:
             return
 
         training_labels = manual_labels_layer.data
-        is_3d = state['orig_ndim'] == 3
-
-        # Shape Validation Check
         if training_labels.shape != state['objects'].shape:
-            print(
-                f"[Object RF] Shape mismatch! 'Object Labels' shape {training_labels.shape} "
-                f'does not match segmented objects shape {state["objects"].shape}. '
-                "Please delete the 'Object Labels' layer and click 'Draw Labels' again."
-            )
+            print('[Object RF] Shape mismatch between labels and objects!')
             return
 
-        # Identify which slices the user actually annotated
+        is_3d = state['orig_ndim'] == 3
         if is_3d:
             labeled_slices = np.where(
                 np.any(training_labels > 0, axis=(1, 2))
@@ -594,430 +272,167 @@ class ObjectWidget(QWidget):
             labeled_slices = [0] if np.any(training_labels > 0) else []
 
         if not labeled_slices:
-            print(
-                "[Object RF] No annotations found in the 'Object Labels' layer."
-            )
             return
 
         state['labeled_slices'] = labeled_slices
-        print(f'[Object RF] Detected annotations on slices: {labeled_slices}')
-
-        self.btn_train.setEnabled(False)
-        self.btn_predict.setEnabled(False)
-        self.btn_segment.setEnabled(False)
+        self.classifier_controls.btn_train.setEnabled(False)
+        self.classifier_controls.btn_predict.setEnabled(False)
+        self.action_buttons.btn_segment.setEnabled(False)
 
         pbar = progress(desc='Extracting Training Features')
 
         @thread_worker
-        def _train_worker():
-            # 0. Find target labels that have annotations
-            target_labels = set()
-            for z in labeled_slices:
-                if is_3d:
-                    obj_slice = state['objects'][z]
-                    ann_slice = training_labels[z]
-                else:
-                    obj_slice = state['objects']
-                    ann_slice = training_labels
-
-                mask = ann_slice > 0
-                labeled_objs = np.unique(obj_slice[mask])
-                for obj_id in labeled_objs:
-                    if obj_id > 0:
-                        target_labels.add(obj_id)
-
-            if not target_labels:
-                print(
-                    '[Object RF] No overlapping annotations found for the objects.'
-                )
-                yield None
-                return
-
-            # 1. Generate features for all objects on annotated slices
-            gen = self.feature_extractor.generate_features(
+        def _worker():
+            yield from train_classifier_worker(
                 state['objects'],
-                intensity_image=intensity_layer.data,
-                indices=labeled_slices,
+                intensity_layer.data,
+                training_labels,
+                labeled_slices,
+                state['orig_ndim'],
+                self.feature_extractor,
+                self.clf,
             )
-
-            feats_df = None
-            for val in gen:
-                if isinstance(val, tuple):
-                    yield val
-                else:
-                    feats_df = val
-
-            if feats_df is None or feats_df.empty:
-                yield None
-                return
-
-            feats_df['true_label'] = 0
-
-            # 2. Match objects with user annotations to build training set
-            X_train = []
-            y_train = []
-            feature_cols = [
-                c
-                for c in feats_df.columns
-                if c not in ('label', 'slice_id', 'true_label')
-            ]
-
-            for idx, row in feats_df.iterrows():
-                lbl = int(row['label'])
-                z = int(row['slice_id'])
-
-                # Get the user's annotation within this specific object's mask
-                if is_3d:
-                    obj_mask = state['objects'][z] == lbl
-                    ann = training_labels[z][obj_mask]
-                else:
-                    obj_mask = state['objects'] == lbl
-                    ann = training_labels[obj_mask]
-
-                # Use the max class ID drawn inside the object
-                max_cls = np.max(ann)
-                if max_cls > 0:
-                    feats_df.at[idx, 'true_label'] = max_cls
-                    X_train.append(row[feature_cols].values)
-                    y_train.append(max_cls)
-
-            if not X_train:
-                print(
-                    '[Object RF] No overlapping annotations found for the objects.'
-                )
-                yield None
-                return
-
-            # 3. Train Classifier
-            self.clf.train(X_train, y_train)
-
-            # Store the training features into the full_feature_table
-            if state['full_feature_table'] is None:
-                state['full_feature_table'] = feats_df
-            else:
-                existing_df = state['full_feature_table']
-                if 'true_label' not in existing_df.columns:
-                    existing_df['true_label'] = 0
-
-                # Remove rows corresponding to these slices to replace them
-                existing_df = existing_df[
-                    ~existing_df['slice_id'].isin(labeled_slices)
-                ]
-
-                state['full_feature_table'] = pd.concat(
-                    [existing_df, feats_df], ignore_index=True
-                )
-
-            # 4. Predict probabilities on training slices to generate a preview
-            X_all = feats_df[feature_cols].values
-            probas = self.clf.predict_proba(X_all)
-            classes = self.clf.clf.classes_
-            n_classes = len(classes)
-
-            # Probability buffer shape: (Z, C, Y, X) for 3D, (C, Y, X) for 2D
-            if is_3d:
-                prob_buffer = np.zeros(
-                    (
-                        state['objects'].shape[0],
-                        n_classes,
-                        *state['objects'].shape[1:],
-                    ),
-                    dtype=np.float32,
-                )
-            else:
-                prob_buffer = np.zeros(
-                    (n_classes, *state['objects'].shape), dtype=np.float32
-                )
-
-            for i, (_, row) in enumerate(feats_df.iterrows()):
-                lbl = int(row['label'])
-                z = int(row['slice_id'])
-                cls_probas = probas[i]
-
-                if is_3d:
-                    mask = state['objects'][z] == lbl
-                    for c_idx in range(n_classes):
-                        prob_buffer[z, c_idx][mask] = cls_probas[c_idx]
-                else:
-                    mask = state['objects'] == lbl
-                    for c_idx in range(n_classes):
-                        prob_buffer[c_idx][mask] = cls_probas[c_idx]
-
-            yield prob_buffer
 
         def _on_yielded(val):
             if isinstance(val, tuple):
                 step, total, desc = val
-                pbar.total = total
-                pbar.n = step
+                pbar.total, pbar.n = total, step
                 pbar.set_description(desc)
                 pbar.refresh()
             elif val is not None:
-                # Flag ready so saving logic can proceed
+                feats_df, prob_buffer = val
                 self._clf_ready = True
-                state['training_probabilities'] = val
+                state['training_probabilities'] = prob_buffer
+
+                # Update state feature table
+                if state['full_feature_table'] is None:
+                    state['full_feature_table'] = feats_df
+                else:
+                    existing_df = state['full_feature_table']
+                    if 'true_label' not in existing_df.columns:
+                        existing_df['true_label'] = 0
+                    existing_df = existing_df[
+                        ~existing_df['slice_id'].isin(labeled_slices)
+                    ]
+                    state['full_feature_table'] = pd.concat(
+                        [existing_df, feats_df], ignore_index=True
+                    )
 
                 layer_name = 'Object Training Probabilities'
                 if layer_name in self.viewer.layers:
-                    self.viewer.layers[layer_name].data = val
+                    self.viewer.layers[layer_name].data = prob_buffer
                 else:
-                    self.viewer.add_image(val, name=layer_name)
+                    self.viewer.add_image(prob_buffer, name=layer_name)
 
         def _on_finished():
             pbar.close()
-            self.btn_train.setEnabled(True)
-            self.btn_segment.setEnabled(True)
+            self.classifier_controls.btn_train.setEnabled(True)
+            self.action_buttons.btn_segment.setEnabled(True)
             if self._clf_ready:
-                self.btn_predict.setEnabled(True)
-                self.btn_save_model.setEnabled(True)
+                self.classifier_controls.btn_predict.setEnabled(True)
+                self.io_controls.btn_save_model.setEnabled(True)
                 self._on_layer_change()
                 print('[Object RF] Training completed successfully.')
 
-        worker = _train_worker()
+        worker = _worker()
         worker.yielded.connect(_on_yielded)
         worker.finished.connect(_on_finished)
         worker.start()
 
     def predict_objects(self):
-        """Apply RF to all slices. Extracts features -> predicts -> discards features to save memory."""
-        active_image = self.get_selected_layer()
+        active_image = self.layer_selection.get_selected_layer(self.viewer)
         if active_image is None or not self._clf_ready:
             return
 
-        state = self.image_states.get(active_image)
-        intensity_layer = self.get_intensity_layer()
-        is_3d = state['orig_ndim'] == 3
-
+        state = self.state_manager.get_state(active_image)
+        intensity_layer = self.layer_selection.get_intensity_layer(self.viewer)
         if not intensity_layer:
-            print('[Object RF] No intensity image selected.')
             return
 
-        self.btn_train.setEnabled(False)
-        self.btn_predict.setEnabled(False)
-        self.btn_segment.setEnabled(False)
+        self.classifier_controls.btn_train.setEnabled(False)
+        self.classifier_controls.btn_predict.setEnabled(False)
+        self.action_buttons.btn_segment.setEnabled(False)
 
-        print(f'[Object RF] Applying Random Forest to full {state["name"]}...')
         pbar = progress(desc='Applying Random Forest')
 
         @thread_worker
-        def _apply_rf_worker():
-            classes = self.clf.clf.classes_
-            n_classes = len(classes)
-            all_collected_features = []
-
-            if is_3d:
-                prob_results = np.zeros(
-                    (
-                        state['objects'].shape[0],
-                        n_classes,
-                        *state['objects'].shape[1:],
-                    ),
-                    dtype=np.float32,
-                )
-            else:
-                prob_results = np.zeros(
-                    (n_classes, *state['objects'].shape), dtype=np.float32
-                )
-
-            if is_3d:
-                total_slices = state['objects'].shape[0]
-                for z in range(total_slices):
-                    # Hybrid Workflow: Reuse cached features from table if available
-                    existing_df = None
-                    if state['full_feature_table'] is not None:
-                        mask = state['full_feature_table']['slice_id'] == z
-                        if mask.any():
-                            existing_df = state['full_feature_table'][
-                                mask
-                            ].copy()
-
-                    if existing_df is not None:
-                        feats_df = existing_df
-                        yield (
-                            z + 1,
-                            total_slices,
-                            f'Slice {z + 1}/{total_slices}: Reusing cached features',
-                        )
-                    else:
-                        gen = self.feature_extractor.generate_features(
-                            state['objects'],
-                            intensity_image=intensity_layer.data,
-                            indices=[z],
-                        )
-                        feats_df = None
-                        for val in gen:
-                            if isinstance(val, tuple):
-                                yield (
-                                    z + 1,
-                                    total_slices,
-                                    f'Slice {z + 1}/{total_slices}: {val[2]}',
-                                )
-                            else:
-                                feats_df = val
-
-                    if feats_df is not None and not feats_df.empty:
-                        all_collected_features.append(feats_df)
-                        feature_cols = [
-                            c
-                            for c in feats_df.columns
-                            if c not in ('label', 'slice_id', 'true_label')
-                        ]
-                        X = feats_df[feature_cols].values
-                        probas = self.clf.predict_proba(X)
-
-                        slice_objs = state['objects'][z]
-                        for i, (_, row) in enumerate(feats_df.iterrows()):
-                            lbl = int(row['label'])
-                            mask = slice_objs == lbl
-                            for c_idx in range(n_classes):
-                                prob_results[z, c_idx][mask] = probas[i][c_idx]
-
-                # Update master feature table with all collected data
-                if all_collected_features:
-                    state['full_feature_table'] = pd.concat(
-                        all_collected_features, ignore_index=True
-                    )
-
-                yield prob_results
-            else:
-                # 2D: Reuse existing table if available
-                if state['full_feature_table'] is None:
-                    gen = self.feature_extractor.generate_features(
-                        state['objects'], intensity_image=intensity_layer.data
-                    )
-                    feats_df = None
-                    for val in gen:
-                        if isinstance(val, tuple):
-                            yield (0, 1, val[2])
-                        else:
-                            feats_df = val
-                    state['full_feature_table'] = feats_df
-
-                feats_df = state['full_feature_table']
-                if feats_df is not None and not feats_df.empty:
-                    feature_cols = [
-                        c
-                        for c in feats_df.columns
-                        if c not in ('label', 'slice_id', 'true_label')
-                    ]
-                    X = feats_df[feature_cols].values
-                    probas = self.clf.predict_proba(X)
-
-                    slice_objs = state['objects']
-                    for i, (_, row) in enumerate(feats_df.iterrows()):
-                        lbl = int(row['label'])
-                        mask = slice_objs == lbl
-                        for c_idx in range(n_classes):
-                            prob_results[c_idx][mask] = probas[i][c_idx]
-                yield prob_results
+        def _worker():
+            yield from apply_rf_worker(
+                state['objects'],
+                intensity_layer.data,
+                state['orig_ndim'],
+                state['full_feature_table'],
+                self.feature_extractor,
+                self.clf,
+            )
 
         def _on_yielded(val):
-            if isinstance(val, tuple):
+            if isinstance(val, tuple) and len(val) == 3:
                 z, total, desc = val
                 pbar.total, pbar.n = total, z
                 pbar.set_description(desc)
                 pbar.refresh()
-            else:
-                state['prediction_probabilities'] = val
+            elif val is not None:
+                final_table, prob_results = val
+                if final_table is not None:
+                    state['full_feature_table'] = final_table
+                state['prediction_probabilities'] = prob_results
 
                 layer_name = 'Object Probabilities'
                 if layer_name in self.viewer.layers:
-                    self.viewer.layers[layer_name].data = val
+                    self.viewer.layers[layer_name].data = prob_results
                 else:
-                    self.viewer.add_image(val, name=layer_name)
+                    self.viewer.add_image(prob_results, name=layer_name)
 
         def _on_finished():
             pbar.close()
-            self.btn_predict.setEnabled(True)
-            self.btn_train.setEnabled(True)
-            self.btn_segment.setEnabled(True)
+            self.classifier_controls.btn_predict.setEnabled(True)
+            self.classifier_controls.btn_train.setEnabled(True)
+            self.action_buttons.btn_segment.setEnabled(True)
             self._on_layer_change()
             print('[Object RF] Random Forest application complete.')
 
-        worker = _apply_rf_worker()
+        worker = _worker()
         worker.yielded.connect(_on_yielded)
         worker.finished.connect(_on_finished)
         worker.start()
 
-    def _get_save_dir(self, state):
-        intensity_layer = self.get_intensity_layer()
-        if intensity_layer is None:
-            return Path.home() / 'object_rf_export'
-
-        # Try to get path from source
-        path = None
-        source = getattr(intensity_layer, 'source', None)
-        raw_path = getattr(source, 'path', None)
-        if raw_path:
-            path = str(
-                raw_path[0]
-                if isinstance(raw_path, (list, tuple))
-                else raw_path
-            )
-
-        if path:
-            save_dir = Path(path).parent / intensity_layer.name
-        else:
-            save_dir = Path.home() / intensity_layer.name
-
-        save_dir.mkdir(parents=True, exist_ok=True)
-        return save_dir
-
     def save_labels(self):
         manual_labels_layer = self.get_manual_labels_layer()
         if manual_labels_layer is not None:
-            try:
-                state = self.image_states.get(self._current_image)
-                labels = manual_labels_layer.data
+            state = self.state_manager.get_state(
+                self.state_manager.current_image
+            )
+            labels = manual_labels_layer.data
+            is_3d = state and state['orig_ndim'] == 3
+            if state and not is_3d and labels.ndim == 3:
+                labels = np.max(labels, axis=0)
+            elif state and is_3d and labels.ndim == 4:
+                labels = np.max(labels, axis=1)
 
-                is_3d = state and state['orig_ndim'] == 3
-                if state and not is_3d and labels.ndim == 3:
-                    labels = np.max(labels, axis=0)
-                elif state and is_3d and labels.ndim == 4:
-                    labels = np.max(labels, axis=1)
-
-                save_dir = self._get_save_dir(state)
-                intensity_layer = self.get_intensity_layer()
-                name = intensity_layer.name if intensity_layer else 'labels'
-                save_path = save_dir / f'{name}_object_manual_labels.tif'
-                imsave(
-                    str(save_path),
-                    labels.astype(np.uint8),
-                    check_contrast=False,
-                )
-                print(f'[Object RF] Saved labels to {save_path}')
-            except (OSError, ValueError, RuntimeError) as e:
-                print(f'[Object RF] Error in save_labels: {e}')
-        else:
-            print('[Object RF] No manual labels layer found to save.')
+            intensity_layer = self.layer_selection.get_intensity_layer(
+                self.viewer
+            )
+            save_dir = get_save_directory(
+                intensity_layer,
+                intensity_layer.name if intensity_layer else 'labels',
+            )
+            name = intensity_layer.name if intensity_layer else 'labels'
+            save_path = save_dir / f'{name}_object_manual_labels.tif'
+            imsave(
+                str(save_path), labels.astype(np.uint8), check_contrast=False
+            )
+            print(f'[Object RF] Saved labels to {save_path}')
 
     def save_predictions(self):
-        active_image = self.get_selected_layer()
-        state = self.image_states.get(active_image)
+        state = self.state_manager.get_state(self.state_manager.current_image)
         if state and state['prediction_probabilities'] is not None:
             self._save_state_outputs(
                 state, 'prediction_probabilities', 'object_full'
             )
 
-    def save_features(self):
-        active_image = self.get_selected_layer()
-        state = self.image_states.get(active_image)
-        if state and state['full_feature_table'] is not None:
-            save_dir = self._get_save_dir(state)
-            intensity_layer = self.get_intensity_layer()
-            name = intensity_layer.name if intensity_layer else state['name']
-            save_path = save_dir / f'{name}_full_features.csv'
-
-            state['full_feature_table'].to_csv(save_path, index=False)
-            print(f'[Object RF] Saved full feature table to {save_path}')
-        else:
-            print(
-                "[Object RF] No feature table available. Run 'Apply RF' first."
-            )
-
     def save_training_predictions(self):
-        active_image = self.get_selected_layer()
-        state = self.image_states.get(active_image)
+        state = self.state_manager.get_state(self.state_manager.current_image)
         if state and state['training_probabilities'] is not None:
             self._save_state_outputs(
                 state, 'training_probabilities', 'object_training'
@@ -1025,42 +440,59 @@ class ObjectWidget(QWidget):
 
     def _save_state_outputs(self, state, prob_key, suffix):
         prob_map = state[prob_key]
-        class_map = self._get_class_map(prob_map)
+        classes = self.clf.clf.classes_
+        class_map = get_class_map(prob_map, classes)
 
-        save_dir = self._get_save_dir(state)
-        intensity_layer = self.get_intensity_layer()
+        intensity_layer = self.layer_selection.get_intensity_layer(self.viewer)
+        save_dir = get_save_directory(
+            intensity_layer,
+            intensity_layer.name if intensity_layer else state['name'],
+        )
         name = intensity_layer.name if intensity_layer else state['name']
 
-        # Save Integer Class Labels
         imsave(
             str(save_dir / f'{name}_{suffix}_class.tif'),
             class_map.astype(np.uint8),
             check_contrast=False,
         )
-
-        # Save Float Probability Maps
         imsave(
             str(save_dir / f'{name}_{suffix}_probs.tif'),
             prob_map.astype(np.float32),
             check_contrast=False,
         )
-
         print(
             f'[Object RF] Saved {suffix} class map and probabilities to {save_dir}'
         )
 
+    def save_features(self):
+        state = self.state_manager.get_state(self.state_manager.current_image)
+        if state and state['full_feature_table'] is not None:
+            intensity_layer = self.layer_selection.get_intensity_layer(
+                self.viewer
+            )
+            save_dir = get_save_directory(
+                intensity_layer,
+                intensity_layer.name if intensity_layer else state['name'],
+            )
+            name = intensity_layer.name if intensity_layer else state['name']
+            save_path = save_dir / f'{name}_full_features.csv'
+            state['full_feature_table'].to_csv(save_path, index=False)
+            print(f'[Object RF] Saved full feature table to {save_path}')
+
     def save_model(self):
-        if self.clf is None:
-            return
-        state = self.image_states.get(self._current_image)
-        save_dir = self._get_save_dir(state)
+        state = self.state_manager.get_state(self.state_manager.current_image)
+        intensity_layer = self.layer_selection.get_intensity_layer(self.viewer)
+        save_dir = get_save_directory(
+            intensity_layer,
+            intensity_layer.name if intensity_layer else state['name'],
+        )
         default_path = str(save_dir / 'object_classifier.joblib')
 
         save_path, _ = QFileDialog.getSaveFileName(
             self, 'Save Model', default_path, 'Model (*.joblib)'
         )
         if save_path:
-            dump(self.clf.clf, save_path)  # Save the internal sklearn model
+            dump(self.clf.clf, save_path)
             print(f'Model saved to {save_path}')
 
     def load_model(self):
@@ -1069,15 +501,13 @@ class ObjectWidget(QWidget):
         )
         if load_path:
             self.clf = ObjectClassifier()
-            self.clf.clf = load(load_path)  # Load directly into the wrapper
+            self.clf.clf = load(load_path)
             self._clf_ready = True
             self._on_layer_change()
             print(f'Model loaded from {load_path}')
 
     def reset_all(self):
-        """Reset internal state to default."""
         self.clf = ObjectClassifier()
-        self.image_states.clear()
-        self._current_image = None
+        self.state_manager.reset_all()
         self._clf_ready = False
         self._on_layer_change()
