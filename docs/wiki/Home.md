@@ -1,6 +1,6 @@
-# Welcome to the object-rf Wiki
+# Welcome to the object-xgb Wiki
 
-**object-rf** is a napari plugin for classification of objects (cells, particles, etc.) using machine learning based on morphological and intensity features.
+**object-xgb** is a napari plugin for classification of objects (cells, particles, etc.) using machine learning based on morphological and intensity features.
 
 ## Project Goal
 This plugin is designed to process the results of pixel-level classification (like those from `napari-rf`). By segmenting the probability maps and extracting object-level features, the user can classify discrete entities within the image.

@@ -1,6 +1,6 @@
 ---
 name: "\U0001F4DA Documentation"
-about: Report an issue with object-rf documentation
+about: Report an issue with object-xgb documentation
 title: ''
 labels: documentation
 assignees: ''

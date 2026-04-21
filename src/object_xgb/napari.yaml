@@ -1,0 +1,38 @@
+name: object-xgb
+display_name: Object XGB
+visibility: public
+contributions:
+  commands:
+    - id: object-xgb.get_reader
+      python_name: object_xgb._reader:napari_get_reader
+      title: Open data with Object Rf
+    - id: object-xgb.write_multiple
+      python_name: object_xgb._writer:write_multiple
+      title: Save multi-layer data with Object Rf
+    - id: object-xgb.write_single_image
+      python_name: object_xgb._writer:write_single_image
+      title: Save image data with Object Rf
+    - id: object-xgb.make_sample_data
+      python_name: object_xgb._sample_data:make_sample_data
+      title: Load sample data from Object Rf
+    - id: object-xgb.make_object_widget
+      python_name: object_xgb:ObjectWidget
+      title: Make Object Classification Widget
+  readers:
+    - command: object-xgb.get_reader
+      accepts_directories: false
+      filename_patterns: ['*.npy']
+  writers:
+    - command: object-xgb.write_multiple
+      layer_types: ['image*','labels*']
+      filename_extensions: []
+    - command: object-xgb.write_single_image
+      layer_types: ['image']
+      filename_extensions: ['.npy']
+  sample_data:
+    - command: object-xgb.make_sample_data
+      display_name: Object Rf
+      key: unique_id.1
+  widgets:
+    - command: object-xgb.make_object_widget
+      display_name: Object Classification

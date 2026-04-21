@@ -1,6 +1,6 @@
 import numpy as np
 
-from object_rf._widget import ObjectWidget
+from object_xgb._widget import ObjectWidget
 
 
 def test_object_widget_init(make_napari_viewer):

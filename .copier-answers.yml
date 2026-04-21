@@ -4,7 +4,7 @@ _src_path: https://github.com/napari/napari-plugin-template
 display_name: Object Rf
 email: michaelseelion@outlook.com
 full_name: Chuyao Wang
-github_repository_url: https://github.com/chuyaowang/object-rf
+github_repository_url: https://github.com/chuyaowang/object-xgb
 github_username_or_organization: chuyaowang
 include_reader_plugin: true
 include_sample_data_plugin: true
@@ -13,6 +13,6 @@ include_writer_plugin: true
 install_dependabot: true
 install_precommit: true
 license: MIT
-module_name: object_rf
-plugin_name: object-rf
+module_name: object_xgb
+plugin_name: object-xgb
 short_description: Object classification using random forest.

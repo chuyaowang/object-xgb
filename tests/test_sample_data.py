@@ -1,4 +1,4 @@
-# from object_rf import make_sample_data
+# from object_xgb import make_sample_data
 
 # add your tests here...
 

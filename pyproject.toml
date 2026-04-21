@@ -1,7 +1,7 @@
 [project]
-name = "object-rf"
+name = "object-xgb"
 dynamic = ["version"]
-description = "Object classification using random forest."
+description = "High-performance object classification using PLS-DA and XGBoost."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -39,7 +39,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # Allow easily installation with the full, default napari installation
-# (including Qt backend) using object-rf[all].
+# (including Qt backend) using object-xgb[all].
 all = ["napari[all]"]
 
 [dependency-groups]
@@ -52,13 +52,13 @@ dev = [
 ]
 
 [project.entry-points."napari.manifest"]
-object-rf = "object_rf:napari.yaml"
+object-xgb = "object_xgb:napari.yaml"
 
 [project.urls]
-"Bug Tracker" = "https://github.com/chuyaowang/object-rf/issues"
-"Documentation" = "https://github.com/chuyaowang/object-rf#README.md"
-"Source Code" = "https://github.com/chuyaowang/object-rf"
-"User Support" = "https://github.com/chuyaowang/object-rf/issues"
+"Bug Tracker" = "https://github.com/chuyaowang/object-xgb/issues"
+"Documentation" = "https://github.com/chuyaowang/object-xgb#README.md"
+"Source Code" = "https://github.com/chuyaowang/object-xgb"
+"User Support" = "https://github.com/chuyaowang/object-xgb/issues"
 
 [build-system]
 requires = ["setuptools>=77.0.3", "setuptools_scm"]
@@ -74,7 +74,7 @@ where = ["src"]
 "*" = ["*.yaml"]
 
 [tool.setuptools_scm]
-write_to = "src/object_rf/_version.py"
+write_to = "src/object_xgb/_version.py"
 fallback_version = "0.0.1+nogit"
 
 [tool.pytest.ini_options]

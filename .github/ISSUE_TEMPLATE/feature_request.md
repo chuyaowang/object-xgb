@@ -1,6 +1,6 @@
 ---
 name: "\U0001F680 Feature Request"
-about: Submit a proposal/request for a new object-rf feature
+about: Submit a proposal/request for a new object-xgb feature
 title: ''
 labels: feature
 assignees: ''

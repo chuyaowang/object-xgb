@@ -1,26 +1,29 @@
 # Architecture
 
-The **object-rf** plugin is structured into three main modules: GUI, Feature Extraction, and Classification.
+The **object-xgb** plugin is structured into three main modules: GUI, Feature Extraction, and Classification.
 
 ## Core Modules
 
-### 1. The Orchestrator (`src/object_rf/_widget.py`)
+### 1. The Orchestrator (`src/object_xgb/_widget.py`)
 - Acts as the central hub connecting UI signals to state management and background thread workers.
 - Delegates heavy logic to specific modules rather than implementing algorithms directly.
 
-### 2. State Management (`src/object_rf/state.py`)
+### 2. State Management (`src/object_xgb/state.py`)
 - **`ImageStateManager`**: Centralized tracking of `Image` and `Labels` layers, their metadata (shapes, paths, original dimensionality), and cached features/probabilities.
 
-### 3. Asynchronous Workers (`src/object_rf/workers.py`)
-- Contains pure Python functions and generators for computationally heavy tasks: segmentation, random forest training, and full-stack predictions.
+### 3. Asynchronous Workers (`src/object_xgb/workers.py`)
+- Contains pure Python functions and generators for computationally heavy tasks: segmentation, PLS-DA + XGBoost training, and full-stack predictions.
+- **Optimized Prediction**: Uses the `selected_features` list from the classifier to gate the `FeatureExtractor`, avoiding calculation of unneeded feature groups.
 - Fully decoupled from `napari.viewer` and Qt GUI updates.
 
-### 4. UI Components (`src/object_rf/components/`)
-- A modular collection of QWidgets breaking down the interface: `LayerSelectionWidget`, `ActionButtonsWidget`, `ClassifierControlsWidget`, and `IOControlsWidget`.
+### 4. UI Components (`src/object_xgb/components/`)
+- A modular collection of QWidgets: `LayerSelectionWidget`, `ActionButtonsWidget`, `ClassifierControlsWidget` (now with VIP Threshold slider), and `IOControlsWidget`.
 
 ### 5. `FeatureExtractor` & `ObjectClassifier`
-- **`FeatureExtractor`**: Slice-by-slice 0.5-99.5% normalized multi-layer feature extraction (Geometry, Intensity, Texture).
-- **`ObjectClassifier`**: Wrapper around `RandomForestClassifier` optimized for `predict_proba` single-pass inference.
+- **`FeatureExtractor`**: Slice-by-slice 0.5-99.5% normalized multi-layer feature extraction. Always maintains a fixed 69-feature schema via NaN padding.
+- **`ObjectClassifier`**: A unified pipeline consisting of:
+    - `PairwisePLSFeatureSelector`: Uses VIP scores to filter redundant features.
+    - `ObjectXGBoostClassifier`: High-performance classification with automated class-weight balancing.
 
 ## Data Flow Diagram
 
@@ -28,16 +31,16 @@ The **object-rf** plugin is structured into three main modules: GUI, Feature Ext
 graph TD
 %%{init: {"flowchart": {"defaultRenderer": "elk"}} }%%
     A[Pixel Probs / Mask] -->|Argmax/Label| B(Object Labels)
-    B -->|Feature Extraction| C(Feature DataFrame)
-    C -->|Intersection with Labels Layer| D{Random Forest Model}
-    C -->|predict_proba| E[Probabilities map]
-    E -->|argmax| F[Classified Objects]
-    D --> E
+    B -->|Feature Extraction| C(69-Feature Table)
+    C -->|VIP Threshold Slider| D{PLS-DA Selector}
+    D -->|Reduced Features| E[XGBoost Classifier]
+    E -->|predict_proba| F[Probabilities map]
+    F -->|argmax| G[Classified Objects]
 ```
 
 ## Segmentation Pipeline
 
-To ensure high-quality object classification, `object-rf` uses a robust, multi-step pipeline to segment objects from pixel-level predictions (from `napari-rf`):
+To ensure high-quality object classification, `object-xgb` uses a robust, multi-step pipeline:
 
 1. **Probability to Mask (`argmax`)**:
     - Probability stacks from `napari-rf` are converted to class maps.
@@ -58,7 +61,7 @@ To ensure high-quality object classification, `object-rf` uses a robust, multi-s
 
 ## Memory Optimization & Caching
 
-To handle high-resolution 3D stacks without exhausting system RAM, `object-rf` employs several aggressive memory-saving design choices.
+To handle high-resolution 3D stacks without exhausting system RAM, `object-xgb` employs several aggressive memory-saving design choices.
 
 ### 1. Hybrid Feature Caching
 Feature extraction is the most computationally expensive and memory-intensive part of the pipeline. The plugin manages this via a dual-cache system:
@@ -71,7 +74,7 @@ Feature extraction is the most computationally expensive and memory-intensive pa
 -   **Last-Slice Buffer**: Only the features for the *most recently processed slice* are kept in `prediction_features` to allow for quick re-application if parameters change slightly.
 
 ### 2. State-Based Data Management
-Instead of duplicating large arrays across the Napari viewer and internal logic, `object-rf` uses a centralized `image_states` dictionary:
+Instead of duplicating large arrays across the Napari viewer and internal logic, `object-xgb` uses a centralized `image_states` dictionary:
 -   **Reference Tracking**: It stores references to active layers and their source paths.
 -   **On-Demand Clearing**: When a user switches to a new image in the dropdown, the plugin detects if large feature or probability caches exist for the previous image and prompts the user to clear them.
 
@@ -82,29 +85,28 @@ Storing both a 4D probability map (`float32`) and a 3D class map (`uint8`) for a
 
 ## Feature Matrix Structure
 
-The cached feature matrix (`training_features`) is stored as a **Pandas DataFrame** with the following structure:
+The feature table is stored as a **Pandas DataFrame** with a fixed schema.
 
 ### Rows (Instances)
 - Each row represents a **unique object-slice pair**.
 - For 2D images, there is one row per segmented object.
 - For 3D images, a single 3D object that spans multiple slices is represented as **independent 2D instances** (one row for every slice it appears in). This allows the classifier to leverage slice-specific local context.
 
-### Columns (69 Total)
+### Columns (72 Total)
 | Group | Count | Names / Descriptions |
 | :--- | :--- | :--- |
-| **Metadata** | 2 | `label`, `slice_id` |
+| **Metadata** | 3 | `label`, `slice_id`, `true_label` (Ground Truth) |
 | **Geometry** | 10 | `log_area`, `eccentricity`, `circularity`, `hu_moment_0` to `6` |
 | **Intensity (Raw)** | 14 | Mean, Var, Skew, Kurtosis, and 10-bin normalized histogram. |
 | **Intensity (Sobel)**| 14 | Edge-enhanced stats and 10-bin histogram. |
 | **Intensity (Frangi)**| 14 | Tubular-enhanced stats and 10-bin histogram. |
-| **Texture (GLCM)** | 5 | Contrast, Dissimilarity, Homogeneity, Energy, Correlation (averaged across 4 angles). |
-| **Texture (LBP)** | 10 | 10-bin Local Binary Pattern histogram (Uniform method, P=8, R=1). |
+| **Texture (GLCM)** | 5 | Contrast, Dissimilarity, Homogeneity, Energy, Correlation. |
+| **Texture (LBP)** | 10 | 10-bin Local Binary Pattern histogram (Uniform method). |
 
-## Feature Engineering Pipeline
+## Optimization Strategies
 
-Objects are characterized by a combination of shape and internal texture derived from three image layers:
+### 1. Group-Aware Feature Extraction
+The `FeatureExtractor` uses a dependency-aware logic. If the PLS-DA selector identifies `raw_mean` as important, the extractor calculates the **entire** `intensity_raw` group (mean, variance, and histogram). This ensures the mathematical integrity of the feature space while skipping entirely unrelated groups (like `texture_glcm`) to save time.
 
-- **Geometry (Label Mask)**: Log Area, Eccentricity, Circularity, and 7 Log-Hu Moments.
-- **Intensity (Raw Image)**: First-order statistics (Mean, Var, Skew, Kurtosis) and a 10-bin normalized histogram.
-- **Edge Texture (Sobel Filter)**: Highlights sharp intensity transitions (e.g., chromatin granularity).
-- **Tubular Texture (Frangi Filter)**: Highlights ridge-like structures (e.g., internal filaments or hyphal infection).
+### 2. NaN Padding and Schema Consistency
+To allow models to be saved and loaded across different images, the feature table always maintains all 69 feature columns. Features that are not calculated (either due to user selection or optimization) are filled with `NaN`. This ensures the XGBoost pipeline always receives a table with the expected shape and column names.

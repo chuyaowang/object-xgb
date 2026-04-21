@@ -1,4 +1,4 @@
-# from object_rf import write_single_image, write_multiple
+# from object_xgb import write_single_image, write_multiple
 
 # add your tests here...
 

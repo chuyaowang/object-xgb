@@ -1,28 +1,27 @@
-# Gemini Context: object-rf
+# Gemini Context: object-xgb
 
 ## Project Overview
-`object-rf` is a napari plugin for object-level classification using Random Forest. It bridges pixel-level segmentation and high-level object analysis by extracting morphological and intensity features from segmented objects and training classifiers to categorize them.
+`object-xgb` is a napari plugin for object-level classification using Random Forest. It bridges pixel-level segmentation and high-level object analysis by extracting morphological and intensity features from segmented objects and training classifiers to categorize them.
 
 ### Main Technologies
 - **Python**: Core language.
 - **napari**: Multi-dimensional image viewer and plugin framework.
-- **scikit-image**: Used for segmentation (thresholding), labeling (`measure.label`), and feature extraction (`measure.regionprops`).
-- **scikit-learn**: Provides the `RandomForestClassifier` for object-level classification.
+- **scikit-image**: Used for segmentation, labeling, and feature extraction.
+- **scikit-learn**: Provides base PLS and utility functions.
+- **XGBoost**: High-performance gradient boosting for object classification.
 - **Qt/qtpy**: GUI framework.
 - **joblib**: Model serialization.
 
 ### Key Architecture
-- **Modular Design**: The plugin uses a component-based structure to separate concerns:
-    - **`_widget.py`**: The central orchestrator for UI signals and threading.
-    - **`state.py`**: Houses `ImageStateManager` for centralized tracking of image data, paths, and feature caches.
-    - **`workers.py`**: Contains decoupled pure Python generators for all heavy asynchronous algorithms (segmentation, training, prediction).
-    - **`components/`**: Directory containing isolated `QWidget` UI blocks.
-- **Feature Extraction**: Leverages `regionprops_table` to generate a tabular representation of objects for machine learning.
-- **Workflow**:
-    1.  Convert Probability maps (from `napari-rf`) into Labels.
-    2.  Compute geometrical (area, perimeter) and intensity (mean, max) features.
-    3.  User-guided training (annotating specific labels with classes).
-    4.  Full-stack object classification.
+- **Modular Design**:
+    - **`_widget.py`**: Central orchestrator. Handles `true_label` metadata population during training to ensure CSV reports match user actions.
+    - **`classifier.py`**: Unified `ObjectClassifier` pipeline managing both `PairwisePLSFeatureSelector` (for discriminative filtering) and `ObjectXGBoostClassifier` (for non-linear classification).
+    - **`state.py`**: `ImageStateManager` tracks feature tables and probability caches.
+    - **`workers.py`**: Asynchronous generators for segmentation, training, and prediction.
+- **Feature Extraction**:
+    - **Fixed Schema**: `FeatureExtractor` always produces a 69-feature table (Metadata + Geometry + Hu + Intensity + Texture).
+    - **Group-Aware Optimization**: Requesting one feature in a group triggers the calculation of the entire group.
+    - **Consistency**: Tables from different images are unified via `reindex` and NaN padding to ensure model pipeline compatibility.
 
 ---
 
