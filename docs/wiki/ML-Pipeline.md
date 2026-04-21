@@ -57,3 +57,24 @@ Once the Pairwise PLS-DA filters the features (typically reducing the set from 6
 ### Safety Mechanisms
 *   **Threshold Capping:** The VIP threshold is capped at `max(VIP) * 0.99`. This ensures that even if a user sets the slider to 5.0, the system will always select at least the single best feature instead of crashing with an empty set.
 *   **Balanced Weighting:** During the final XGBoost phase, sample weights are automatically adjusted to prevent the model from ignoring rare object classes.
+
+---
+
+## 4. Automated Data Augmentation & Balancing
+
+To improve model robustness and handle biological datasets with limited or imbalanced annotations, `object-xgb` automatically synthesizes training data in RAM during the training phase.
+
+### Scale-Aware Augmentation
+Tabular features have vastly different scales (e.g., area in thousands, intensity in fractions). The `FeatureAugmentor` applies augmentations using signal-dependent logic:
+
+1.  **Signal-Dependent Gaussian Jittering**: Adds multiplicative noise: $X_{new} = X \times (1 + \mathcal{N}(0, \text{noise\_level}))$. This ensures that dim objects receive proportionally smaller noise than bright objects, preserving the intensity profile of different classes.
+2.  **Random Scaling**: Multiplies features by a random factor ($0.95 - 1.05$) to simulate global intensity or size variations (calibration errors).
+3.  **Class-Aware Feature Dropout**: Randomly replaces $5\%$ of features with the **mean value of that feature within its specific class**. This prevents feature drift and ensures synthetic samples remain representative of their biological category.
+
+### SMOTE-style Balancing
+If one class has significantly fewer labels than others, the system uses synthetic interpolation:
+*   **Mechanism**: It identifies the nearest neighbors of a minority sample **within the same class** and generates a new point along the line connecting them.
+*   **Benefit**: This populates the "decision space" of rare biological events (like "Invaded") using the natural variance found in the real data.
+*   **Fallback**: If only a single sample exists for a class, the system falls back to noise-based jittering for that class.
+
+**Note**: Augmented samples are used strictly for model fitting. They are never stored in the `ImageStateManager` or exported to the final CSV analysis report, ensuring your raw measurements remain untainted.

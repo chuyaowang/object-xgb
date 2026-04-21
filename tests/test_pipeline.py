@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 
+from object_xgb.augmentation import FeatureAugmentor
 from object_xgb.classifier import ObjectClassifier
 from object_xgb.feature_selection import PairwisePLSFeatureSelector
 from object_xgb.xgboost_classifier import ObjectXGBoostClassifier
@@ -89,3 +90,48 @@ def test_full_report_generation():
         for col in ['slice_id', 'label', 'true_label', 'predicted_label']
     )
     assert len(report) == n_samples
+
+
+def test_augmentation_logic():
+    n_samples = 10
+    # Features with different scales
+    X = pd.DataFrame(
+        {
+            'small': np.random.normal(0, 1, n_samples),
+            'large': np.random.normal(0, 1000, n_samples),
+            'constant': np.ones(n_samples),
+        }
+    )
+    y = pd.Series([1] * 5 + [2] * 5)
+
+    n_repeats = 2
+    augmentor = FeatureAugmentor(n_repeats=n_repeats, random_state=42)
+    X_aug, y_aug = augmentor.augment(X, y)
+
+    # Should have original + n_repeats * original
+    assert len(X_aug) == n_samples * (1 + n_repeats)
+    assert len(y_aug) == len(X_aug)
+
+    # Verify scale-awareness (rough check)
+    # The 'large' feature noise should be much larger than 'small' feature noise
+    # We compare the std of the augmented rows (excluding the first n_samples)
+    noise_part = X_aug.iloc[n_samples:]
+    assert noise_part['large'].std() > noise_part['small'].std() * 10
+
+
+def test_classifier_with_augmentation():
+    n_samples = 20
+    X = pd.DataFrame(
+        np.random.randn(n_samples, 5), columns=[f'f{i}' for i in range(5)]
+    )
+    y = pd.Series([1] * 10 + [2] * 10)
+
+    # Train with augmentation
+    pipeline = ObjectClassifier(
+        use_augmentation=True, augmentation_params={'n_repeats': 1}
+    )
+    pipeline.train(X, y)
+
+    preds = pipeline.predict(X)
+    assert len(preds) == n_samples
+    assert set(preds).issubset({1, 2})

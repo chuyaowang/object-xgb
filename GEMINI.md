@@ -15,12 +15,14 @@
 ### Key Architecture
 - **Modular Design**:
     - **`_widget.py`**: Central orchestrator. Handles `true_label` metadata population during training to ensure CSV reports match user actions.
-    - **`classifier.py`**: Unified `ObjectClassifier` pipeline managing both `PairwisePLSFeatureSelector` (for discriminative filtering) and `ObjectXGBoostClassifier` (for non-linear classification).
+    - **`classifier.py`**: Unified `ObjectClassifier` pipeline managing `PairwisePLSFeatureSelector` (for discriminative filtering), `FeatureAugmentor` (for data synthesis), and `ObjectXGBoostClassifier` (for non-linear classification).
+    - **`augmentation.py`**: Scale-aware data augmentation. Implements signal-dependent Gaussian jittering, random scaling, and SMOTE-style interpolation to handle imbalanced classes.
     - **`state.py`**: `ImageStateManager` tracks feature tables and probability caches.
     - **`workers.py`**: Asynchronous generators for segmentation, training, and prediction.
 - **Feature Extraction**:
     - **Fixed Schema**: `FeatureExtractor` always produces a 69-feature table (Metadata + Geometry + Hu + Intensity + Texture).
     - **Group-Aware Optimization**: Requesting one feature in a group triggers the calculation of the entire group.
+    - **Data Synthesis**: Labeled training data is automatically augmented (2x repeats) and balanced (SMOTE-style) in RAM during training to improve model robustness. Gaussian jitter is signal-dependent (multiplicative) to preserve intensity relationships between classes. Synthetic samples are never exported to disk.
     - **Consistency**: Tables from different images are unified via `reindex` and NaN padding to ensure model pipeline compatibility.
 
 ---
@@ -30,7 +32,7 @@
 ### Git and Source Control
 - **Branching**: Use descriptive feature branches (e.g., `feature/object-extraction`).
 - **Commit Logic**: Commit logically grouped changes.
-- **Commit Message Style**: **Comprehensive and detailed**. Include a summary and a bulleted list of technical improvements.
+- **Commit Message Style**: **Comprehensive and detailed**. Always use the `commit type: commit message` format for commit messages (e.g., `fix: add missing dependencies`, `feat: add new classifier`). Include a summary and a bulleted list of technical improvements.
 
 ### Documentation and Wiki
 - **"Code Wiki" Preference**: Maintain a technical "code wiki" in `docs/wiki/`.

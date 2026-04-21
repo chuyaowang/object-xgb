@@ -15,6 +15,7 @@
 - **Optimized Feature Extraction**: Extract 69 geometrical, intensity, and texture features (including GLCM, LBP, Hu Moments, and Frangi/Sobel filters).
 - **Pairwise PLS-DA Filtering**: Automated feature selection using pairwise VIP (Variable Importance in Projection) scores to isolate the most discriminative signals.
 - **XGBoost Classification**: Robust, multi-class classification with automated class-imbalance handling (balanced weighting).
+- **Automated Data Augmentation**: Automatically generates synthetic training samples via scale-aware Gaussian jittering, random scaling, and SMOTE-style interpolation to improve model generalization and handle rare biological classes.
 - **Group-Aware Computation**: Intelligent feature calculation that avoids redundant processing by gating computations based on user selection.
 - **Detailed Reporting**: Export comprehensive CSV reports containing object metadata, ground truth, predictions, and the full feature matrix.
 - **3D Stack Support**: Fully compatible with large 2D/3D image stacks, processing data slice-by-slice to maintain low RAM overhead.

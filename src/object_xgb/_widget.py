@@ -286,8 +286,15 @@ class ObjectWidget(QWidget):
         self.classifier_controls.btn_predict.setEnabled(False)
         self.action_buttons.btn_segment.setEnabled(False)
 
-        # Update classifier threshold from UI slider
+        # Update classifier settings from UI
         self.clf.selector.threshold = self.classifier_controls.get_threshold()
+
+        # Default to enabling augmentation and balancing
+        self.clf.use_augmentation = True
+        self.clf.balance_classes = True
+        from .augmentation import FeatureAugmentor
+
+        self.clf.augmentor = FeatureAugmentor(n_repeats=2)
 
         pbar = progress(desc='Extracting Training Features')
 
