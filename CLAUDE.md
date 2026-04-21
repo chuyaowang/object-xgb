@@ -32,7 +32,7 @@
 ### Git and Source Control
 - **Branching**: Use descriptive feature branches (e.g., `feature/object-extraction`).
 - **Commit Logic**: Commit logically grouped changes.
-- **Commit Message Style**: **Comprehensive and detailed**. Always use the `commit type: commit message` format for commit messages (e.g., `fix: add missing dependencies`, `feat: add new classifier`). Include a summary and a bulleted list of technical improvements.
+- **Commit Message Style**: **Comprehensive and detailed**. Always use the `commit type: commit message` format for commit messages (e.g., `fix: add missing dependencies`, `feat: add new classifier`). Include a summary and a bulleted list of technical improvements. Do not contact information at the end of the commit message.
 
 ### Documentation and Wiki
 - **"Code Wiki" Preference**: Maintain a technical "code wiki" in `docs/wiki/`.
