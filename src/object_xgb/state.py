@@ -52,6 +52,7 @@ class ImageStateManager:
             'objects': None,  # Filtered + dilated label image
             'labeled_slices': [],  # Indices for 3D stacks
             'full_feature_table': None,  # Master DataFrame for all processed objects
+            'selected_feature_groups': None,  # Groups computed by last prediction phase
             'training_probabilities': None,  # Buffer for training slice probs
             'prediction_probabilities': None,  # Buffer for full stack probs
         }

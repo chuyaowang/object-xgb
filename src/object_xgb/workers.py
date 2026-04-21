@@ -69,6 +69,36 @@ def segment_objects_worker(data: np.ndarray, orig_ndim: int, layer_type: str):
     return final_labels
 
 
+def _merge_feature_supplement(
+    cached: pd.DataFrame,
+    supplement: pd.DataFrame,
+    supplement_cols: list[str],
+) -> pd.DataFrame:
+    """Fill NaN feature columns in cached with values from supplement.
+
+    Parameters
+    ----------
+    cached : pd.DataFrame
+        Rows from the feature cache with partial NaN feature columns.
+    supplement : pd.DataFrame
+        Freshly computed rows containing values for the previously-NaN columns.
+    supplement_cols : list[str]
+        The feature column names that supplement provides.
+
+    Returns
+    -------
+    pd.DataFrame
+        A copy of cached with supplement_cols filled in from supplement,
+        joined on (label, slice_id).
+    """
+    merged = cached.copy().set_index(['label', 'slice_id'])
+    sup_indexed = supplement.set_index(['label', 'slice_id'])[supplement_cols]
+    for col in supplement_cols:
+        if col in sup_indexed.columns:
+            merged[col] = sup_indexed[col]
+    return merged.reset_index()
+
+
 def train_classifier_worker(
     state_objects: np.ndarray,
     intensity_data: np.ndarray,
@@ -77,8 +107,34 @@ def train_classifier_worker(
     orig_ndim: int,
     feature_extractor,
     classifier,
+    full_feature_table: pd.DataFrame | None = None,
+    selected_feature_groups: set[str] | None = None,
 ):
-    """Core logic for training the classifier."""
+    """Core logic for training the classifier.
+
+    Parameters
+    ----------
+    state_objects : np.ndarray
+        Segmented label image (2D or 3D).
+    intensity_data : np.ndarray
+        Raw intensity image matching state_objects shape.
+    training_labels : np.ndarray
+        Manual annotation layer data.
+    labeled_slices : list[int]
+        Slice indices that contain manual annotations.
+    orig_ndim : int
+        Original image dimensionality (2 or 3).
+    feature_extractor : FeatureExtractor
+        Extractor instance used to compute features.
+    classifier : ObjectClassifier
+        Classifier pipeline to train.
+    full_feature_table : pd.DataFrame or None
+        Cached feature table from a previous training or prediction run.
+        Rows may have partial features (NaN) if computed during prediction.
+    selected_feature_groups : set[str] or None
+        Feature groups computed during the last prediction phase. Used to
+        determine which groups are missing from prediction-phase cached rows.
+    """
     is_3d = orig_ndim == 3
 
     # 0. Find target labels that have annotations
@@ -98,25 +154,142 @@ def train_classifier_worker(
         yield None
         return
 
-    # 1. Generate features (Calculate ALL groups for training stage)
-    gen = feature_extractor.generate_features(
-        state_objects, intensity_image=intensity_data, indices=labeled_slices
+    # 1. Categorize each labeled slice by its cache status
+    #    cached_complete: all 69 feature columns present (no NaN) → reuse directly
+    #    cached_partial:  only selected groups present (has NaN) → compute missing groups
+    #    missing:         not in cache at all → compute all groups
+    all_feature_cols = feature_extractor.get_all_feature_names()
+    all_group_names = set(feature_extractor.FEATURE_GROUPS.keys())
+
+    cached_complete: dict[int, pd.DataFrame] = {}
+    cached_partial: dict[int, pd.DataFrame] = {}
+    missing_slices: list[int] = []
+
+    if full_feature_table is not None:
+        for z in labeled_slices:
+            mask = full_feature_table['slice_id'] == z
+            if mask.any():
+                rows = full_feature_table[mask].copy()
+                if rows[all_feature_cols].isna().any(axis=None):
+                    cached_partial[z] = rows
+                else:
+                    cached_complete[z] = rows
+            else:
+                missing_slices.append(z)
+    else:
+        missing_slices = list(labeled_slices)
+
+    n_complete = len(cached_complete)
+    n_partial = len(cached_partial)
+    n_missing = len(missing_slices)
+
+    if n_complete or n_partial:
+        print(
+            f'[Object XGB] Feature cache: {n_complete} slice(s) fully cached, '
+            f'{n_partial} slice(s) partially cached, '
+            f'{n_missing} slice(s) to compute.'
+        )
+
+    # 2. Determine which feature groups are missing from partial-cache slices
+    missing_group_names: set[str] = set()
+    missing_group_features: list[str] = []
+
+    if cached_partial:
+        if selected_feature_groups is not None:
+            missing_group_names = all_group_names - selected_feature_groups
+        else:
+            # No record of what was computed → treat as fully missing
+            missing_slices.extend(cached_partial.keys())
+            cached_partial = {}
+
+        if missing_group_names:
+            missing_group_features = [
+                f
+                for g in missing_group_names
+                for f in feature_extractor.FEATURE_GROUPS[g]
+            ]
+
+    # 3. Compute all features for fully-missing slices
+    computed_complete: dict[int, pd.DataFrame] = {}
+    if missing_slices:
+        gen = feature_extractor.generate_features(
+            state_objects,
+            intensity_image=intensity_data,
+            indices=missing_slices,
+        )
+        raw_df = None
+        for val in gen:
+            if isinstance(val, tuple):
+                yield val
+            else:
+                raw_df = val
+
+        if raw_df is not None and not raw_df.empty:
+            for z in missing_slices:
+                z_rows = raw_df[raw_df['slice_id'] == z]
+                if not z_rows.empty:
+                    computed_complete[z] = z_rows
+
+    # 4. Compute missing feature groups for partially-cached slices
+    computed_supplements: dict[int, pd.DataFrame] = {}
+    partial_slice_list = list(cached_partial.keys())
+
+    if partial_slice_list and missing_group_features:
+        gen = feature_extractor.generate_features(
+            state_objects,
+            intensity_image=intensity_data,
+            indices=partial_slice_list,
+            selected_features=missing_group_features,
+        )
+        sup_df = None
+        for val in gen:
+            if isinstance(val, tuple):
+                yield val
+            else:
+                sup_df = val
+
+        if sup_df is not None and not sup_df.empty:
+            for z in partial_slice_list:
+                z_rows = sup_df[sup_df['slice_id'] == z]
+                if not z_rows.empty:
+                    computed_supplements[z] = z_rows
+
+    # 5. Merge supplement into partial-cache rows to produce complete rows
+    merged_partial: list[pd.DataFrame] = []
+    for z, partial_rows in cached_partial.items():
+        if z in computed_supplements:
+            merged = _merge_feature_supplement(
+                partial_rows, computed_supplements[z], missing_group_features
+            )
+        else:
+            merged = partial_rows
+        merged_partial.append(merged)
+
+    # 6. Assemble the full feature DataFrame for all labeled slices
+    all_parts = (
+        list(cached_complete.values())
+        + list(computed_complete.values())
+        + merged_partial
     )
 
-    feats_df = None
-    for val in gen:
-        if isinstance(val, tuple):
-            yield val
-        else:
-            feats_df = val
-
-    if feats_df is None or feats_df.empty:
+    if not all_parts:
         yield None
         return
 
+    feats_df = pd.concat(all_parts, ignore_index=True)
+
+    if feats_df.empty:
+        yield None
+        return
+
+    # Emit a final progress tick when all features came from cache
+    if not missing_slices and not partial_slice_list:
+        n = len(labeled_slices)
+        yield (n, n, f'Features loaded from cache for {n} slice(s)')
+
     feats_df['true_label'] = 0
 
-    # 2. Match objects with user annotations
+    # 7. Match objects with user annotations to populate true_label
     X_train = []
     y_train = []
     feature_cols = feature_extractor.get_all_feature_names()

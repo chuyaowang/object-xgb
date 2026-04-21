@@ -308,6 +308,8 @@ class ObjectWidget(QWidget):
                 state['orig_ndim'],
                 self.feature_extractor,
                 self.clf,
+                full_feature_table=state['full_feature_table'],
+                selected_feature_groups=state['selected_feature_groups'],
             )
 
         def _on_yielded(val):
@@ -326,13 +328,20 @@ class ObjectWidget(QWidget):
                     state['full_feature_table'] = feats_df
                 else:
                     existing_df = state['full_feature_table']
-                    # We only calculate the selected features here, but FeatureExtractor reindexes to full schema
                     existing_df = existing_df[
                         ~existing_df['slice_id'].isin(labeled_slices)
                     ]
                     state['full_feature_table'] = pd.concat(
                         [existing_df, feats_df], ignore_index=True
                     )
+
+                # Record which feature groups the trained model selected so the
+                # next training round knows what prediction-phase rows are missing.
+                state['selected_feature_groups'] = (
+                    self.feature_extractor._get_required_groups(
+                        self.clf.selected_features
+                    )
+                )
 
                 layer_name = 'Object Training Probabilities'
                 if layer_name in self.viewer.layers:
