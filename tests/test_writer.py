@@ -1,7 +1,18 @@
-# from object_xgb import write_single_image, write_multiple
+import numpy as np
 
-# add your tests here...
+from object_xgb._writer import write_multiple, write_single_image
 
 
-def test_something():
-    pass
+def test_write_single_image(tmp_path):
+    path = str(tmp_path / 'test.txt')
+    data = np.random.rand(10, 10)
+    meta = {}
+    result = write_single_image(path, data, meta)
+    assert result == [path]
+
+
+def test_write_multiple(tmp_path):
+    path = str(tmp_path / 'test_dir')
+    data = [(np.random.rand(10, 10), {}, 'image')]
+    result = write_multiple(path, data)
+    assert result == [path]
